@@ -1,0 +1,7 @@
+*.so
+*.dll
+__pycache__/
+firmware/build/
+firmware/sdkconfig
+firmware/managed_components/
+cubo_*.csv

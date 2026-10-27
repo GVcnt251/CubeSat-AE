@@ -1,0 +1,40 @@
+menu "Cubo"
+
+    config CUBE_WIFI_SSID
+        string "Wi-Fi SSID"
+        default "cubo"
+
+    config CUBE_WIFI_PASS
+        string "Wi-Fi password"
+        default "changeme123"
+
+    config CUBE_GS_PORT
+        int "Porta UDP do cubo (a estação de terra liga-se aqui)"
+        default 5000
+
+    config CUBE_CAM_LATENCY_MS
+        int "Latência da câmara (ms): do instante do disparo à chegada da imagem ao núcleo"
+        default 80
+        help
+          Valor inicial (do guião: "quase um décimo de segundo"). MEDIR no hardware: piscar um LED
+          em frente da câmara e comparar o instante do disparo com o da deteção.
+
+    config CUBE_WHEEL_FAKE
+        bool "Roda simulada em software (sem moteus/CAN) - para testar o firmware na bancada"
+        default y
+        help
+          O driver MCP2518FD (SPI->CAN-FD) ainda é um esqueleto (can_mcp2518fd.c). Enquanto não
+          estiver implementado, a roda é um modelo de 1.ª ordem com limite de aceleração.
+
+    config CUBE_MOTEUS_ID
+        int "ID CAN do moteus"
+        default 1
+
+    config CUBE_WHEEL_SIGN
+        int "Sinal da roda (+1 ou -1) conforme a montagem do motor"
+        default 1
+        help
+          ERRADO = realimentação POSITIVA (o cubo foge do alvo). Verificar no nível 1/3: com
+          WHEEL > 0 o cubo tem de rodar com guinada NEGATIVA (anti-horário visto de cima).
+
+endmenu

@@ -1,0 +1,5 @@
+numpy
+matplotlib
+PyQt5
+pyqtgraph
+pyserial   # opcional: ligação USB-série do cubo real

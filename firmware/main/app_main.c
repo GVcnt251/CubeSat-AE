@@ -1,0 +1,93 @@
+/*
+ * app_main.c - liga o núcleo de controlo (core/) ao hardware.
+ *
+ *   control_task  200 Hz, núcleo 1, prioridade 20 : IMU -> cc_step -> roda (moteus)
+ *   camera_task   ~20 fps, núcleo 0               : câmara -> cc_detect -> cc_on_detection
+ *   comms_task    200 Hz, núcleo 0                : UDP (TC in, TM out)
+ *
+ * Nada de lógica de controlo aqui: está toda em core/, igual ao simulador (SIL).
+ */
+#include <string.h>
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "nvs_flash.h"
+#include "app.h"
+#include "battery.h"
+#include "board.h"
+#include "camera.h"
+#include "comms.h"
+#include "imu.h"
+#include "wheel.h"
+
+static const char *TAG = "cube";
+
+cc_t g_core;
+SemaphoreHandle_t g_core_mtx;
+
+static bool s_imu_ok;
+
+static void control_task(void *arg)
+{
+    TickType_t last = xTaskGetTickCount();
+    const TickType_t period = pdMS_TO_TICKS(1000 / CONTROL_HZ);
+    uint32_t n = 0, stale = 0, late = 0;
+    float vbat = 0;
+    cc_out_t out = { 0 };
+    imu_sample_t s = { 0 };
+    wheel_state_t w = { 0 };
+
+    for (;;) {
+        if (xTaskDelayUntil(&last, period) == pdFALSE) late++;      /* perdeu o prazo */
+        uint64_t t = (uint64_t)esp_timer_get_time();
+
+        if (s_imu_ok) imu_read(&s);                                 /* em falha mantém a última amostra */
+        float mag[3];
+        bool have_mag = (n % MAG_DIV == 0) && mag_read(mag) == ESP_OK;
+        if (n % 40 == 0) vbat = battery_read_v();
+
+        cc_meas_t m = { .wheel_rps = w.vel_rps, .wheel_torque = w.torque_nm, .vbat_v = vbat > 0 ? vbat : w.vbat_v };
+        memcpy(m.gyro, s.gyro, sizeof(m.gyro));
+        memcpy(m.accel, s.accel, sizeof(m.accel));
+
+        CORE_LOCK();
+        if (have_mag) cc_on_mag(&g_core, t, mag);
+        cc_step(&g_core, t, &m, &out);
+        cc_mode_t mode = g_core.mode;
+        CORE_UNLOCK();
+
+        /* segurança (ANTES de enviar): sem IMU só se permite a roda directa */
+        if (!s_imu_ok && mode != CC_MODE_WHEEL) out.enable = 0;
+
+        w = wheel_update(&out);                                     /* envia já o comando; o estado serve o ciclo seguinte */
+#ifndef CONFIG_CUBE_WHEEL_FAKE
+        if (!w.valid) {
+            if (++stale == 40) {                                    /* 200 ms sem resposta do moteus */
+                cc_cmd_t idle = { .type = CC_CMD_MODE, .a = CC_MODE_IDLE };
+                CORE_LOCK(); cc_command(&g_core, &idle); CORE_UNLOCK();
+                ESP_LOGE(TAG, "moteus sem resposta: modo IDLE");
+            }
+        } else stale = 0;
+#endif
+        if (++n % (CONTROL_HZ * 10) == 0 && late) { ESP_LOGW(TAG, "%u ciclos de controlo atrasados", (unsigned)late); late = 0; }
+    }
+}
+
+void app_main(void)
+{
+    esp_err_t e = nvs_flash_init();
+    if (e == ESP_ERR_NVS_NO_FREE_PAGES || e == ESP_ERR_NVS_NEW_VERSION_FOUND) { nvs_flash_erase(); nvs_flash_init(); }
+
+    g_core_mtx = xSemaphoreCreateMutex();
+    cc_init(&g_core, NULL);                                         /* configuração por omissão do núcleo */
+
+    battery_init();
+    s_imu_ok = imu_init() == ESP_OK;
+    if (!s_imu_ok) ESP_LOGE(TAG, "IMU em falta: só o modo WHEEL (nível 1) fica disponível");
+    if (wheel_init() != 0) ESP_LOGE(TAG, "roda indisponível (driver CAN)");
+    comms_init();
+
+    xTaskCreatePinnedToCore(control_task, "control", 4096, NULL, 20, NULL, 1);
+    xTaskCreatePinnedToCore(comms_task, "comms", 6144, NULL, 5, NULL, 0);
+    xTaskCreatePinnedToCore(camera_task, "camera", 8192, NULL, 6, NULL, 0);
+    ESP_LOGI(TAG, "cubo a arrancar: calibração do giroscópio nos primeiros %.1f s (cubo PARADO)", g_core.cfg.calib_s);
+}

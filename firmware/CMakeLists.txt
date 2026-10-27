@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.16)
+# O núcleo de controlo é partilhado com o simulador: ../core (ver components/cube_core)
+set(EXTRA_COMPONENT_DIRS ${CMAKE_CURRENT_LIST_DIR}/components)
+include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+project(cube_firmware)
