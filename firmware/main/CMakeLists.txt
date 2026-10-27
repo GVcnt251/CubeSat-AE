@@ -1,4 +1,24 @@
 idf_component_register(
-    SRCS app_main.c imu.c camera.c wheel.c can_mcp2518fd.c comms.c battery.c
+    SRCS 
+        "app_main.c"
+        "battery.c"
+        "camera.c"
+        "can_mcp2518fd.c"
+        "comms.c"
+        "imu.c"
+        "wheel.c"
     INCLUDE_DIRS "."
-    REQUIRES cube_core driver esp_timer esp_wifi esp_event esp_netif nvs_flash lwip esp_adc)
+    REQUIRES 
+        cube_core
+        driver
+        esp_driver_spi
+        esp_driver_i2c
+        esp_driver_gpio
+        esp_timer
+        esp_adc
+        esp_event
+        esp_wifi
+        esp_netif
+        nvs_flash
+        lwip
+)

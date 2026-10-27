@@ -1,4 +1,4 @@
-#pragma once
+    #pragma once
 /* Pinout do slide "How to start - Hardware" (Seeed XIAO ESP32-S3 Sense) */
 #define PIN_BAT_ADC      1   /* D0  GPIO1  ADC1_CH0, divisor 100k/13k */
 #define PIN_BUZZER       2   /* D1  GPIO2  saída digital, activo alto */
