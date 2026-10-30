@@ -16,9 +16,12 @@ int battery_init(void)
     if (adc_oneshot_new_unit(&u, &s_adc) != ESP_OK) return -1;
     adc_oneshot_chan_cfg_t c = { .atten = ADC_ATTEN_DB_12, .bitwidth = ADC_BITWIDTH_DEFAULT };
     if (adc_oneshot_config_channel(s_adc, ADC_CHANNEL_0, &c) != ESP_OK) return -1;   /* GPIO1 = ADC1_CH0 */
-    adc_cali_curve_fitting_config_t cc = { .unit_id = ADC_UNIT_1, .chan = ADC_CHANNEL_0,
-                                           .atten = ADC_ATTEN_DB_12, .bitwidth = ADC_BITWIDTH_DEFAULT };
-    s_cali_ok = adc_cali_create_scheme_curve_fitting(&cc, &s_cali) == ESP_OK;
+   adc_cali_line_fitting_config_t cc = {
+        .unit_id = ADC_UNIT_1,
+        .atten = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+    };
+    s_cali_ok = adc_cali_create_scheme_line_fitting(&cc, &s_cali) == ESP_OK;
     return 0;
 }
 
