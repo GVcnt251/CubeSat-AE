@@ -30,7 +30,11 @@ static void control_task(void *arg)
 {
     TickType_t last = xTaskGetTickCount();
     const TickType_t period = pdMS_TO_TICKS(1000 / CONTROL_HZ);
-    uint32_t n = 0, stale = 0, late = 0;
+    uint32_t n = 0, late = 0;
+
+    #ifndef CONFIG_CUBE_WHEEL_FAKE
+        uint32_t stale = 0;
+    #endif
     float vbat = 0;
     cc_out_t out = { 0 };
     imu_sample_t s = { 0 };
@@ -40,7 +44,12 @@ static void control_task(void *arg)
         if (xTaskDelayUntil(&last, period) == pdFALSE) late++;      /* perdeu o prazo */
         uint64_t t = (uint64_t)esp_timer_get_time();
 
-        if (s_imu_ok) imu_read(&s);                                 /* em falha mantém a última amostra */
+        bool imu_sample_ok = false;
+
+        if (s_imu_ok) {
+            imu_sample_ok = imu_read(&s) == ESP_OK;
+        }
+
         float mag[3];
         bool have_mag = (n % MAG_DIV == 0) && mag_read(mag) == ESP_OK;
         if (n % 40 == 0) vbat = battery_read_v();
@@ -56,7 +65,9 @@ static void control_task(void *arg)
         CORE_UNLOCK();
 
         /* segurança (ANTES de enviar): sem IMU só se permite a roda directa */
-        if (!s_imu_ok && mode != CC_MODE_WHEEL) out.enable = 0;
+        if (!imu_sample_ok && mode != CC_MODE_WHEEL) {
+            out.enable = 0;
+        }
 
         w = wheel_update(&out);                                     /* envia já o comando; o estado serve o ciclo seguinte */
 #ifndef CONFIG_CUBE_WHEEL_FAKE
@@ -80,7 +91,9 @@ void app_main(void)
     g_core_mtx = xSemaphoreCreateMutex();
     cc_init(&g_core, NULL);                                         /* configuração por omissão do núcleo */
 
-    battery_init();
+    if (battery_init() != 0) {
+    ESP_LOGE(TAG, "Falha na inicialização da leitura da bateria");
+    }
     s_imu_ok = imu_init() == ESP_OK;
     if (!s_imu_ok) ESP_LOGE(TAG, "IMU em falta: só o modo WHEEL (nível 1) fica disponível");
     if (wheel_init() != 0) ESP_LOGE(TAG, "roda indisponível (driver CAN)");
