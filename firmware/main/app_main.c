@@ -18,6 +18,7 @@
 #include "comms.h"
 #include "imu.h"
 #include "wheel.h"
+#include "esp_err.h"
 
 static const char *TAG = "cube";
 
@@ -86,11 +87,23 @@ static void control_task(void *arg)
 void app_main(void)
 {
     esp_err_t e = nvs_flash_init();
-    if (e == ESP_ERR_NVS_NO_FREE_PAGES || e == ESP_ERR_NVS_NEW_VERSION_FOUND) { nvs_flash_erase(); nvs_flash_init(); }
+
+    if (e == ESP_ERR_NVS_NO_FREE_PAGES ||
+        e == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        e = nvs_flash_init();
+    }
+
+ESP_ERROR_CHECK(e);
 
     g_core_mtx = xSemaphoreCreateMutex();
-    cc_init(&g_core, NULL);                                         /* configuração por omissão do núcleo */
 
+    if (g_core_mtx == NULL) {
+        ESP_LOGE(TAG, "Falha ao criar mutex do núcleo");
+        return;
+    }
+
+cc_init(&g_core, NULL);
     if (battery_init() != 0) {
     ESP_LOGE(TAG, "Falha na inicialização da leitura da bateria");
     }
@@ -99,8 +112,27 @@ void app_main(void)
     if (wheel_init() != 0) ESP_LOGE(TAG, "roda indisponível (driver CAN)");
     comms_init();
 
-    xTaskCreatePinnedToCore(control_task, "control", 4096, NULL, 20, NULL, 1);
-    xTaskCreatePinnedToCore(comms_task, "comms", 6144, NULL, 5, NULL, 0);
-    xTaskCreatePinnedToCore(camera_task, "camera", 8192, NULL, 6, NULL, 0);
+        BaseType_t task_result;
+
+        task_result = xTaskCreatePinnedToCore(
+            control_task, "control", 4096, NULL, 20, NULL, 1);
+        if (task_result != pdPASS) {
+            ESP_LOGE(TAG, "Falha ao criar tarefa de controlo");
+            ESP_ERROR_CHECK(ESP_FAIL);
+        }
+
+        task_result = xTaskCreatePinnedToCore(
+            comms_task, "comms", 6144, NULL, 5, NULL, 0);
+        if (task_result != pdPASS) {
+            ESP_LOGE(TAG, "Falha ao criar tarefa de comunicações");
+            ESP_ERROR_CHECK(ESP_FAIL);
+        }
+
+        task_result = xTaskCreatePinnedToCore(
+            camera_task, "camera", 8192, NULL, 6, NULL, 0);
+        if (task_result != pdPASS) {
+            ESP_LOGE(TAG, "Falha ao criar tarefa da câmara");
+            ESP_ERROR_CHECK(ESP_FAIL);
+        }
     ESP_LOGI(TAG, "cubo a arrancar: calibração do giroscópio nos primeiros %.1f s (cubo PARADO)", g_core.cfg.calib_s);
 }
