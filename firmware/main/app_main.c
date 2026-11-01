@@ -60,16 +60,23 @@ static void control_task(void *arg)
         memcpy(m.accel, s.accel, sizeof(m.accel));
 
         CORE_LOCK();
-        if (have_mag) cc_on_mag(&g_core, t, mag);
-        cc_step(&g_core, t, &m, &out);
-        cc_mode_t mode = g_core.mode;
-        CORE_UNLOCK();
 
-        /* segurança (ANTES de enviar): sem IMU só se permite a roda directa */
-        if (!imu_sample_ok && mode != CC_MODE_WHEEL) {
-            out.enable = 0;
+        cc_imu_status_t imu_status = cc_step_with_imu(
+            &g_core, t, &m, imu_sample_ok, &out);
+
+        cc_mode_t mode = g_core.mode;
+
+        if (have_mag && imu_sample_ok &&
+            (imu_status == CC_IMU_OK || mode == CC_MODE_CALIB)) {
+            cc_on_mag(&g_core, t, mag);
         }
 
+        CORE_UNLOCK();
+
+        /* Sem IMU utilizável, bloquear modos dependentes da orientação. */
+        if (imu_status != CC_IMU_OK && mode != CC_MODE_WHEEL) {
+            out.enable = 0;
+        }
         w = wheel_update(&out);                                     /* envia já o comando; o estado serve o ciclo seguinte */
 #ifndef CONFIG_CUBE_WHEEL_FAKE
         if (!w.valid) {
