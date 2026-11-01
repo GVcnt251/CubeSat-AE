@@ -182,6 +182,8 @@ typedef struct cc_s {
 
 void cc_config_default(cc_config_t *cfg);
 void cc_init(cc_t *c, const cc_config_t *cfg);   /* cfg == NULL => valores por omissão */
+/* Invalid commands are ignored. Gains use SI units; zero Ki disables integration. */
+int cc_gain_valid(uint32_t id, float value);
 void cc_command(cc_t *c, const cc_cmd_t *cmd);
 
 /* Chamar a frequência fixa (ex.: 200 Hz). now_us = instante da amostra do IMU. */

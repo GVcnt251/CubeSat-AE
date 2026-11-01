@@ -2,14 +2,14 @@
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
+#include <float.h>
 
 #define PI_F 3.14159265358979f
 #define US(x) ((double)(x) * 1e-6)
 
 static float wrapf(float a)
 {
-    while (a >  PI_F) a -= 2.0f * PI_F;
-    while (a < -PI_F) a += 2.0f * PI_F;
+    a = remainderf(a, 2.0f * PI_F);
     return a;
 }
 static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
@@ -139,13 +139,23 @@ static void finish_calibration(cc_t *c)
 
 /* ------------------------------------------------------------------ comandos */
 
+int cc_gain_valid(uint32_t id, float v)
+{
+    if (id >= CC_GAIN_COUNT || !isfinite(v) || v < 0.0f) return 0;
+    if (id == CC_GAIN_USE_MAG) return v == 0.0f || v == 1.0f;
+    if (id == CC_GAIN_R_CAM || id == CC_GAIN_R_MAG)
+        return v >= sqrtf(FLT_MIN) && v <= sqrtf(FLT_MAX);
+    return 1;
+}
+
 void cc_command(cc_t *c, const cc_cmd_t *cmd)
 {
+    if (!c || !cmd || (cmd->type != CC_CMD_RECAL && !isfinite(cmd->a))) return;
     cc_config_t *g = &c->cfg;
     switch (cmd->type) {
     case CC_CMD_MODE:
         if (c->mode == CC_MODE_CALIB) break;
-        if ((int)cmd->a >= CC_MODE_IDLE && (int)cmd->a <= CC_MODE_TRACK) {
+        if (cmd->a >= CC_MODE_IDLE && cmd->a <= CC_MODE_TRACK && floorf(cmd->a) == cmd->a) {
             if ((cc_mode_t)(int)cmd->a == CC_MODE_TRACK && c->mode != CC_MODE_TRACK) c->entering_track = 1;
             c->mode = (cc_mode_t)(int)cmd->a;
         }
@@ -155,10 +165,10 @@ void cc_command(cc_t *c, const cc_cmd_t *cmd)
     case CC_CMD_HEADING: c->heading_sp = cmd->a; break;
     case CC_CMD_AIM:     c->aim = cmd->a; break;
     case CC_CMD_RECAL:
-        c->mode = CC_MODE_CALIB; c->calibrated = 0; c->started = 0;
-        c->gsum = 0; c->gcount = 0; c->gsq = 0; c->msin = c->mcos = 0; c->mcount = 0;
+        { cc_config_t saved = c->cfg; cc_init(c, &saved); }
         break;
     case CC_CMD_GAIN:
+        if (!cc_gain_valid(cmd->id, cmd->a)) break;
         switch ((cc_gain_t)cmd->id) {
         case CC_GAIN_K_THETA:    g->k_theta = cmd->a; break;
         case CC_GAIN_RATE_KP:    g->rate_kp = cmd->a; break;
@@ -183,6 +193,7 @@ void cc_command(cc_t *c, const cc_cmd_t *cmd)
 void cc_on_mag(cc_t *c, uint64_t t_us, const float m[3])
 {
     (void)t_us;
+    if (!isfinite(m[0]) || !isfinite(m[1]) || !isfinite(m[2])) { c->mag_ok = 0; return; }
     float mag = sqrtf(m[0] * m[0] + m[1] * m[1] + m[2] * m[2]);
     if (fabsf(mag - c->cfg.mag_nom_uT) > c->cfg.mag_tol * c->cfg.mag_nom_uT) { c->mag_ok = 0; return; }
     if (!c->tilt_valid) return;
@@ -214,7 +225,13 @@ int cc_on_detection(cc_t *c, uint64_t t_capture_us, uint64_t now_us, const cc_de
     memset(out, 0, sizeof(*out));
     out->t_capture_ms = (uint32_t)(t_capture_us / 1000);
     out->found = d.found; out->n_cand = d.n_cand;
-    if (!d.found) return 0;
+    if (!d.found || !isfinite(d.x) || !isfinite(d.y) || !isfinite(d.contrast) ||
+        d.x < 0 || d.x >= CC_IMG_W || d.y < 0 || d.y >= CC_IMG_H || d.area <= 0 ||
+        t_capture_us > now_us || (c->target_valid && now_us < c->last_cam_us)) return 0;
+    if (c->h_count > 0) {
+        int oldest = (c->h_head - c->h_count + CC_HIST) % CC_HIST;
+        if (t_capture_us < c->t_hist[oldest]) return 0;
+    }
     out->x = d.x; out->y = d.y; out->area = (uint32_t)d.area; out->contrast = d.contrast;
     out->err_x = atan2f(d.x - c->cfg.cam_cx, c->cfg.cam_fx);
     out->err_y = atan2f(d.y - c->cfg.cam_cy, c->cfg.cam_fy);
@@ -265,6 +282,14 @@ int cc_on_image(cc_t *c, uint64_t t_capture_us, uint64_t now_us, const uint8_t *
 void cc_step(cc_t *c, uint64_t now_us, const cc_meas_t *m, cc_out_t *out)
 {
     const cc_config_t *g = &c->cfg;
+    /* Invalid IMU samples and non-monotonic timestamps must not update the filter. */
+    if (!isfinite(m->gyro[2]) || !isfinite(m->wheel_rps) ||
+        !isfinite(m->accel[0]) || !isfinite(m->accel[1]) || !isfinite(m->accel[2]) ||
+        (c->started && now_us <= c->last_us)) {
+        memset(out, 0, sizeof(*out));
+        c->tlm.wheel_cmd_rps = 0.0f;
+        return;
+    }
     float dt = 0.005f;
     if (!c->started) {
         c->started = 1; c->calib_start_us = now_us; c->last_us = now_us;
@@ -349,7 +374,8 @@ void cc_step(cc_t *c, uint64_t now_us, const cc_meas_t *m, cc_out_t *out)
             float e_w = c->w_ref_prev - w_hat;
 
             /* PI com integração condicional (anti-windup): a roda diminui quando o corpo acelera */
-            float I_new = c->rate_I + e_w * dt;
+            if (g->rate_ki == 0.0f) c->rate_I = 0.0f;
+            float I_new = g->rate_ki > 0.0f ? c->rate_I + e_w * dt : 0.0f;
             float cmd_old = -(g->rate_kp * (e_w) + g->rate_ki * c->rate_I);
             float cmd_new = -(g->rate_kp * (e_w) + g->rate_ki * I_new);
             if (fabsf(cmd_new) <= g->wheel_lim || fabsf(cmd_new) < fabsf(cmd_old)) c->rate_I = I_new;
@@ -357,7 +383,7 @@ void cc_step(cc_t *c, uint64_t now_us, const cc_meas_t *m, cc_out_t *out)
         } else {
             /* seguimento sem salto (bumpless) para quando se fechar a malha */
             float w = (c->mode == CC_MODE_WHEEL) ? out->wheel_cmd_rps : m->wheel_rps;
-            c->rate_I = -w / g->rate_ki;
+            c->rate_I = g->rate_ki > 0.0f ? -w / g->rate_ki : 0.0f;
             c->w_ref_prev = w_hat;
             if (c->mode != CC_MODE_TRACK) c->trk = CC_TRK_NONE;
         }
