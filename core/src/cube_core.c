@@ -23,6 +23,7 @@ void cc_config_default(cc_config_t *g)
     g->cam_fx = 249.0f; g->cam_fy = 249.0f; g->cam_cx = 159.5f; g->cam_cy = 119.5f;
     cc_det_cfg_default(&g->det);
     g->calib_s = 1.5f;
+    g->imu_timeout_us = 50000;
 
     g->q_psi    = 1e-7f;
     g->q_bias   = 1e-9f;
@@ -132,6 +133,9 @@ static void finish_calibration(cc_t *c)
     memset(c->P, 0, sizeof(c->P));
     c->P[0][0] = 0.02f * 0.02f; c->P[1][1] = 1e-6f; c->P[2][2] = 1.0f;
     c->psi_zero = psi;
+    c->imu_calibrated_once = 1;
+    if (c->imu_recal_requested) c->imu_recal_required = 0;
+    c->imu_recal_requested = 0;
     c->calibrated = 1; c->target_valid = 0; c->h_count = 0; c->h_head = 0;
     c->rate_I = 0; c->w_ref_prev = 0;
     c->mode = CC_MODE_IDLE; c->trk = CC_TRK_NONE;
@@ -165,7 +169,14 @@ void cc_command(cc_t *c, const cc_cmd_t *cmd)
     case CC_CMD_HEADING: c->heading_sp = cmd->a; break;
     case CC_CMD_AIM:     c->aim = cmd->a; break;
     case CC_CMD_RECAL:
-        { cc_config_t saved = c->cfg; cc_init(c, &saved); }
+        {
+            cc_config_t saved = c->cfg;
+            int blocked = c->imu_recal_required, once = c->imu_calibrated_once;
+            cc_init(c, &saved);
+            c->imu_recal_required = blocked;
+            c->imu_calibrated_once = once;
+            c->imu_recal_requested = 1;
+        }
         break;
     case CC_CMD_GAIN:
         if (!cc_gain_valid(cmd->id, cmd->a)) break;
@@ -193,6 +204,7 @@ void cc_command(cc_t *c, const cc_cmd_t *cmd)
 void cc_on_mag(cc_t *c, uint64_t t_us, const float m[3])
 {
     (void)t_us;
+    if (c->imu_missing || (c->imu_recal_required && c->mode != CC_MODE_CALIB)) return;
     if (!isfinite(m[0]) || !isfinite(m[1]) || !isfinite(m[2])) { c->mag_ok = 0; return; }
     float mag = sqrtf(m[0] * m[0] + m[1] * m[1] + m[2] * m[2]);
     if (fabsf(mag - c->cfg.mag_nom_uT) > c->cfg.mag_tol * c->cfg.mag_nom_uT) { c->mag_ok = 0; return; }
@@ -220,6 +232,10 @@ void cc_on_mag(cc_t *c, uint64_t t_us, const float m[3])
 /* Actualização do estimador com uma detecção já feita (leve: ~microsegundos). */
 int cc_on_detection(cc_t *c, uint64_t t_capture_us, uint64_t now_us, const cc_det_t *dp, cc_vision_t *out)
 {
+    if (c->imu_missing || c->imu_recal_required) {
+        memset(out, 0, sizeof(*out));
+        return 0;
+    }
     const cc_det_t d = *dp;
 
     memset(out, 0, sizeof(*out));
@@ -279,7 +295,7 @@ int cc_on_image(cc_t *c, uint64_t t_capture_us, uint64_t now_us, const uint8_t *
 
 /* ------------------------------------------------------------------- passo */
 
-void cc_step(cc_t *c, uint64_t now_us, const cc_meas_t *m, cc_out_t *out)
+static void step_valid(cc_t *c, uint64_t now_us, const cc_meas_t *m, cc_out_t *out)
 {
     const cc_config_t *g = &c->cfg;
     /* Invalid IMU samples and non-monotonic timestamps must not update the filter. */
@@ -406,6 +422,74 @@ void cc_step(cc_t *c, uint64_t now_us, const cc_meas_t *m, cc_out_t *out)
     t->torque_nm = m->wheel_torque; t->vbat_v = m->vbat_v;
     t->target_err = c->x[2] - c->x[0];
     t->cam_age_s = c->target_valid ? (float)US(now_us - c->last_cam_us) : -1.0f;
+}
+
+/* Reset all calibration accumulators on any break in the valid window. */
+static void restart_calibration_window(cc_t *c)
+{
+    c->started = 0;
+    c->gsum = c->gsq = 0; c->gcount = 0;
+    c->msin = c->mcos = 0; c->mcount = 0;
+    c->tilt_valid = 0; c->mag_ok = 0;
+}
+
+static void imu_hold_output(cc_t *c, uint64_t now_us, cc_out_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->torque_max_nm = c->cfg.torque_max;
+    out->accel_limit_rps2 = c->cfg.wheel_accel;
+    if (c->mode == CC_MODE_WHEEL && c->imu_calibrated_once) {
+        out->enable = 1;
+        out->wheel_cmd_rps = clampf(c->wheel_sp, -c->cfg.wheel_lim, c->cfg.wheel_lim);
+    }
+    c->tlm.t_ms = (uint32_t)(now_us / 1000);
+    c->tlm.mode = (uint8_t)c->mode;
+    c->tlm.wheel_cmd_rps = out->wheel_cmd_rps;
+}
+
+cc_imu_status_t cc_step_with_imu(cc_t *c, uint64_t now_us,
+                               const cc_meas_t *m, int imu_valid, cc_out_t *out)
+{
+    int monotonic = !c->imu_call_seen || now_us > c->imu_last_call_us;
+    int valid = imu_valid && m && monotonic &&
+        isfinite(m->gyro[2]) && isfinite(m->accel[0]) &&
+        isfinite(m->accel[1]) && isfinite(m->accel[2]);
+    int long_gap = c->imu_seen && now_us >= c->imu_last_valid_us &&
+        now_us - c->imu_last_valid_us > c->cfg.imu_timeout_us;
+    int recovering = c->imu_missing || long_gap;
+    if (monotonic) { c->imu_last_call_us = now_us; c->imu_call_seen = 1; }
+    if (long_gap) c->imu_recal_required = 1;
+    if (!valid) {
+        c->imu_missing = 1;
+        if (c->mode == CC_MODE_CALIB) restart_calibration_window(c);
+        imu_hold_output(c, now_us, out);
+        return c->imu_recal_required ? CC_IMU_RECAL_REQUIRED : CC_IMU_UNAVAILABLE;
+    }
+    c->imu_seen = 1; c->imu_last_valid_us = now_us; c->imu_missing = 0;
+    if (recovering) {
+        if (c->mode == CC_MODE_CALIB) restart_calibration_window(c);
+        else {
+            /* No interpolation across an unobserved interval. */
+            c->last_us = now_us;
+            c->h_count = c->h_head = 0;
+            c->target_valid = 0; c->trk = CC_TRK_NONE;
+            c->rate_I = 0; c->w_ref_prev = 0; c->w_ref_last = 0;
+            c->entering_track = c->mode == CC_MODE_TRACK;
+        }
+    }
+    if ((c->imu_recal_required && c->mode != CC_MODE_CALIB) ||
+        (recovering && c->mode != CC_MODE_CALIB)) {
+        c->last_us = now_us;
+        imu_hold_output(c, now_us, out);
+    } else {
+        step_valid(c, now_us, m, out);
+    }
+    return c->imu_recal_required ? CC_IMU_RECAL_REQUIRED : CC_IMU_OK;
+}
+
+void cc_step(cc_t *c, uint64_t now_us, const cc_meas_t *m, cc_out_t *out)
+{
+    (void)cc_step_with_imu(c, now_us, m, 1, out);
 }
 
 void cc_get_tlm(const cc_t *c, cc_tlm_t *out) { *out = c->tlm; }
