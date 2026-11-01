@@ -1,5 +1,7 @@
 #include "cc_proto.h"
 #include <string.h>
+#include <math.h>
+#include "wire_le.h"
 
 #define RAD2DEG 57.29577951308232f
 #define DEG2RAD 0.017453292519943295f
@@ -18,6 +20,7 @@ uint16_t cc_crc16(const uint8_t *d, size_t n)
 
 size_t cc_frame_pack(uint8_t *o, uint8_t type, uint8_t seq, const uint8_t *pl, uint8_t len)
 {
+    if (!o || len > CC_MAX_PAYLOAD || (len && !pl)) return 0;
     o[0] = CC_SYNC0; o[1] = CC_SYNC1; o[2] = len; o[3] = type; o[4] = seq;
     if (len) memcpy(o + 5, pl, len);
     uint16_t crc = cc_crc16(o + 2, (size_t)len + 3);
@@ -54,11 +57,11 @@ int cc_parser_feed(cc_parser_t *p, uint8_t b)
     return 0;
 }
 
-static void put_u32(uint8_t **p, uint32_t v) { memcpy(*p, &v, 4); *p += 4; }
-static void put_u16(uint8_t **p, uint16_t v) { memcpy(*p, &v, 2); *p += 2; }
-static void put_f32(uint8_t **p, float v)    { memcpy(*p, &v, 4); *p += 4; }
+static void put_u32(uint8_t **p, uint32_t v) { cc_write_le32(*p, v); *p += 4; }
+static void put_u16(uint8_t **p, uint16_t v) { (*p)[0] = (uint8_t)v; (*p)[1] = (uint8_t)(v >> 8); *p += 2; }
+static void put_f32(uint8_t **p, float v)    { cc_write_le_float(*p, v); *p += 4; }
 static void put_u8(uint8_t **p, uint8_t v)   { *(*p)++ = v; }
-static float get_f32(const uint8_t *p)       { float v; memcpy(&v, p, 4); return v; }
+static float get_f32(const uint8_t *p)       { return cc_read_le_float(p); }
 
 size_t cc_pack_tm_state(uint8_t *p0, const cc_tlm_t *t)
 {
@@ -92,6 +95,7 @@ size_t cc_pack_tm_vision(uint8_t *p0, const cc_vision_t *v, uint32_t proc_us)
 
 size_t cc_pack_tm_img_chunk(uint8_t *p0, const uint8_t *g, uint8_t img_id, uint8_t chunk)
 {
+    if (!p0 || !g || chunk >= CC_IMG_NCHUNKS) return 0;
     uint8_t *p = p0;
     put_u8(&p, img_id); put_u8(&p, chunk); put_u8(&p, CC_IMG_NCHUNKS);
     put_u8(&p, CC_IMG_TW); put_u8(&p, CC_IMG_TH);
@@ -114,7 +118,9 @@ size_t cc_pack_tm_ack(uint8_t *p, uint8_t type, uint8_t seq, uint8_t status)
 
 int cc_tc_to_cmd(uint8_t type, const uint8_t *pl, uint8_t len, cc_cmd_t *cmd)
 {
+    if (!cmd) return -ACK_BAD_ARG;
     memset(cmd, 0, sizeof(*cmd));
+    if (len && !pl) return -ACK_BAD_ARG;
     switch (type) {
     case TC_SET_MODE:
         if (len != 1) return -ACK_BAD_LEN;
@@ -122,15 +128,19 @@ int cc_tc_to_cmd(uint8_t type, const uint8_t *pl, uint8_t len, cc_cmd_t *cmd)
         cmd->type = CC_CMD_MODE; cmd->a = (float)pl[0]; return 1;
     case TC_SET_WHEEL:   /* rpm */
         if (len != 4) return -ACK_BAD_LEN;
+        if (!isfinite(get_f32(pl))) return -ACK_BAD_ARG;
         cmd->type = CC_CMD_WHEEL; cmd->a = get_f32(pl) * RPM2RPS; return 1;
     case TC_SET_RATE:    /* deg/s */
         if (len != 4) return -ACK_BAD_LEN;
+        if (!isfinite(get_f32(pl))) return -ACK_BAD_ARG;
         cmd->type = CC_CMD_RATE; cmd->a = get_f32(pl) * DEG2RAD; return 1;
     case TC_SET_HEADING: /* deg */
         if (len != 4) return -ACK_BAD_LEN;
+        if (!isfinite(get_f32(pl))) return -ACK_BAD_ARG;
         cmd->type = CC_CMD_HEADING; cmd->a = get_f32(pl) * DEG2RAD; return 1;
     case TC_SET_AIM:     /* deg */
         if (len != 4) return -ACK_BAD_LEN;
+        if (!isfinite(get_f32(pl))) return -ACK_BAD_ARG;
         cmd->type = CC_CMD_AIM; cmd->a = get_f32(pl) * DEG2RAD; return 1;
     case TC_SET_GAIN: {  /* u8 id + f32 valor (unidades do GS; ver ICD) */
         if (len != 5) return -ACK_BAD_LEN;
@@ -141,9 +151,15 @@ int cc_tc_to_cmd(uint8_t type, const uint8_t *pl, uint8_t len, cc_cmd_t *cmd)
         case CC_GAIN_WHEEL_LIM: v *= RPM2RPS; break;
         default: break;
         }
+        if (!cc_gain_valid(pl[0], v)) return -ACK_BAD_ARG;
         cmd->type = CC_CMD_GAIN; cmd->id = pl[0]; cmd->a = v; return 1;
     }
+    case TC_PING:
+        return len == 0 ? 0 : -ACK_BAD_LEN;
+    case TC_STREAM_CFG:
+        return len == 3 ? 0 : -ACK_BAD_LEN;
     case TC_RECAL:
+        if (len != 0) return -ACK_BAD_LEN;
         cmd->type = CC_CMD_RECAL; return 1;
     default:
         return 0;

@@ -36,6 +36,7 @@ enum {
 enum { ACK_OK = 0, ACK_BAD_LEN = 1, ACK_UNKNOWN = 2, ACK_BAD_ARG = 3 };
 
 uint16_t cc_crc16(const uint8_t *data, size_t n);
+/* out needs len+7 bytes. Returns 0 for invalid length/pointers. */
 size_t   cc_frame_pack(uint8_t *out, uint8_t type, uint8_t seq, const uint8_t *payload, uint8_t len);
 
 typedef struct {

@@ -55,7 +55,7 @@ static void flood(cc_det_ws_t *ws, const uint8_t *img, int seed, int max_area, b
         for (int k = 0; k < 4; k++) {
             int n = nb[k];
             if (n < 0 || !mget(ws, n)) continue;
-            if (sp >= CC_DET_STACK) { b->overflow = 1; continue; }  /* fica para outra semente */
+            if (sp >= CC_DET_STACK) { b->overflow = 2; return; }  /* componente incompleto */
             mclr(ws, n);
             ws->stack[sp++] = (uint32_t)n;
         }
@@ -79,7 +79,12 @@ static int ring_stats(const uint8_t *img, const blob_t *b, int off, float thr, f
 
 void cc_detect(const cc_det_cfg_t *cfg, cc_det_ws_t *ws, const uint8_t *img, cc_det_t *out)
 {
+    if (!out) return;
     memset(out, 0, sizeof(*out));
+    if (!cfg || !ws || !img || !isfinite(cfg->dark_ratio) ||
+        cfg->dark_ratio <= 0.0f || cfg->dark_ratio >= 1.0f ||
+        cfg->min_area <= 0 || cfg->max_area < cfg->min_area || cfg->max_area > CC_IMG_N)
+        return;
 
     /* 1) histograma (subamostrado 2x2); fundo = percentil 90 (robusto a sombras e ao ponto) */
     uint32_t hist[256];
@@ -119,6 +124,8 @@ void cc_detect(const cc_det_cfg_t *cfg, cc_det_ws_t *ws, const uint8_t *img, cc_
 
             blob_t b;
             flood(ws, img, seed, cfg->max_area, &b);
+            /* Incomplete components cannot be safely classified: reject this frame. */
+            if (b.overflow == 2) return;
 
             if (b.overflow || b.area > cfg->max_area) {
                 if (n_ab < 4) aborted[n_ab++] = b;
@@ -145,7 +152,7 @@ void cc_detect(const cc_det_cfg_t *cfg, cc_det_ws_t *ws, const uint8_t *img, cc_
             if (score > best_score) { best_score = score; bb = b; bb_ring = ring; bb_in = inner; }
         }
     }
-    out->n_cand = (uint8_t)cand;
+    out->n_cand = (uint8_t)(cand > 255 ? 255 : cand);
     if (best_score < 0.0f) return;
 
     /* 4) centroide sub-pixel: peso = quanto abaixo do meio-termo entre fundo e interior */
