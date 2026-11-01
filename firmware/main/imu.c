@@ -55,11 +55,17 @@ esp_err_t imu_init(void)
         ESP_LOGE(TAG, "MPU-6050 não responde (WHO_AM_I=0x%02x, err=%s)", id, esp_err_to_name(e));
         return ESP_FAIL;
     }
-    ESP_ERROR_CHECK(wr(s_mpu, 0x6B, 0x01));                  /* PWR_MGMT_1: acordar, relógio = PLL gyro X */
-    ESP_ERROR_CHECK(wr(s_mpu, 0x19, 4));                     /* SMPLRT_DIV: 1 kHz/(1+4) = 200 Hz */
-    ESP_ERROR_CHECK(wr(s_mpu, 0x1A, 0x03));                  /* CONFIG: DLPF ~42 Hz */
-    ESP_ERROR_CHECK(wr(s_mpu, 0x1B, 0x08));                  /* GYRO_CONFIG: +-500 dps */
-    ESP_ERROR_CHECK(wr(s_mpu, 0x1C, 0x08));                  /* ACCEL_CONFIG: +-4 g */
+    e = wr(s_mpu, 0x6B, 0x01);                  /* relógio */
+    if (e == ESP_OK) e = wr(s_mpu, 0x19, 4);    /* 200 Hz */
+    if (e == ESP_OK) e = wr(s_mpu, 0x1A, 0x03); /* filtro */
+    if (e == ESP_OK) e = wr(s_mpu, 0x1B, 0x08); /* giroscópio */
+    if (e == ESP_OK) e = wr(s_mpu, 0x1C, 0x08); /* acelerómetro */
+
+    if (e != ESP_OK) {
+        ESP_LOGE(TAG, "Falha ao configurar MPU-6050: %s",
+                 esp_err_to_name(e));
+        return e;
+    }
 
         id = 0;
         e = rd(s_mag, 0x0F, &id, 1);  /* WHO_AM_I = 0x3D */
