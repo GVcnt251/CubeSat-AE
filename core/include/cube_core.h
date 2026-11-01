@@ -142,6 +142,7 @@ typedef struct {
     float wheel_lim, torque_max, wheel_accel;
     /* máquina de estados de seguimento */
     float t_lock, t_search, search_rate;
+    uint32_t imu_timeout_us; /* Default 50000; internal, not TMTC. */
 } cc_config_t;
 
 typedef struct cc_s {
@@ -178,6 +179,10 @@ typedef struct cc_s {
     float wheel_meas;
 
     cc_tlm_t tlm;
+    uint64_t imu_last_valid_us, imu_last_call_us;
+    int imu_seen, imu_call_seen, imu_missing, imu_recal_required, imu_recal_requested;
+    int imu_calibrated_once;
+
 } cc_t;
 
 void cc_config_default(cc_config_t *cfg);
@@ -187,6 +192,19 @@ int cc_gain_valid(uint32_t id, float value);
 void cc_command(cc_t *c, const cc_cmd_t *cmd);
 
 /* Chamar a frequência fixa (ex.: 200 Hz). now_us = instante da amostra do IMU. */
+typedef enum {
+    CC_IMU_OK = 0,
+    CC_IMU_UNAVAILABLE,
+    CC_IMU_RECAL_REQUIRED
+} cc_imu_status_t;
+
+/* Valid means a fresh IMU sample for this cycle. Long gaps latch RECAL_REQUIRED.
+ * The latch clears only after a requested, continuous calibration completes.
+ * First recovered sample rebases time without prediction or PI integration.
+ * WHEEL may run with unavailable IMU after initial calibration; motor health
+ * must be enforced by the caller. All structures must be recompiled together. */
+cc_imu_status_t cc_step_with_imu(cc_t *c, uint64_t now_us,
+                               const cc_meas_t *m, int imu_valid, cc_out_t *out);
 void cc_step(cc_t *c, uint64_t now_us, const cc_meas_t *m, cc_out_t *out);
 
 /* Assíncronas */

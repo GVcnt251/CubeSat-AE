@@ -78,15 +78,17 @@ static void control(void) {
     cmd.type=CC_CMD_HEADING; cmd.a=1e30f; cc_command(&core,&cmd);
     cmd.type=CC_CMD_MODE; cmd.a=CC_MODE_HEADING; cc_command(&core,&cmd);
     cc_step(&core,1620000,&m,&out);
+    assert(!out.enable); /* first recovered sample only rebases time */
+    cc_step(&core,1625000,&m,&out);
     assert(out.enable && isfinite(out.wheel_cmd_rps));
     float mag[]={NAN,0,0}; cc_on_mag(&core,1620000,mag);
     assert(!core.mag_ok && isfinite(core.x[0]));
     cc_det_t d={0}; cc_vision_t v;
     d.found=1; d.x=159.5f; d.y=119.5f; d.area=100; d.contrast=180;
-    assert(!cc_on_detection(&core,1620001,1620000,&d,&v));
-    assert(!cc_on_detection(&core,1,1620000,&d,&v));
-    assert(cc_on_detection(&core,1620000,1620000,&d,&v));
-    d.x=NAN; assert(!cc_on_detection(&core,1620000,1620000,&d,&v));
+    assert(!cc_on_detection(&core,1625001,1625000,&d,&v));
+    assert(!cc_on_detection(&core,1,1625000,&d,&v));
+    assert(cc_on_detection(&core,1625000,1625000,&d,&v));
+    d.x=NAN; assert(!cc_on_detection(&core,1625000,1625000,&d,&v));
     cmd.type=CC_CMD_RECAL; cc_command(&core,&cmd);
     assert(!core.target_valid && !core.h_count && !core.entering_track && !core.calibrated);
     assert(core.cfg.rate_ki==0 && core.mode==CC_MODE_CALIB);
