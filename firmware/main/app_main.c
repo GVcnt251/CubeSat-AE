@@ -115,7 +115,11 @@ cc_init(&g_core, NULL);
     ESP_LOGE(TAG, "Falha na inicialização da leitura da bateria");
     }
     s_imu_ok = imu_init() == ESP_OK;
-    if (!s_imu_ok) ESP_LOGE(TAG, "IMU em falta: só o modo WHEEL (nível 1) fica disponível");
+    if (!s_imu_ok) {
+        ESP_LOGE(TAG,
+                "Falha na inicialização da IMU: corrigir a causa e reiniciar o ESP32. "
+                "WHEEL requer calibração inicial concluída.");
+    }
     if (wheel_init() != 0) ESP_LOGE(TAG, "roda indisponível (driver CAN)");
     comms_init();
 
