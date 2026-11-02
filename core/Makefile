@@ -29,8 +29,11 @@ test_core$(EXE): tests/test_core.c $(SRCS) $(wildcard include/*.h)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_core.c $(SRCS) -lm $(LDEXTRA) $(LDLIBS)
 test_imu$(EXE): tests/test_imu.c $(SRCS) $(wildcard include/*.h)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_imu.c $(SRCS) -lm $(LDEXTRA) $(LDLIBS)
-test: test_core$(EXE) test_imu$(EXE)
+test_review$(EXE): tests/test_review.c $(SRCS) $(wildcard include/*.h)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_review.c $(SRCS) -lm $(LDEXTRA) $(LDLIBS)
+test: test_core$(EXE) test_imu$(EXE) test_review$(EXE)
 	./test_core$(EXE)
 	./test_imu$(EXE)
+	./test_review$(EXE)
 clean:
-	$(RM) libcubecore.so libcubecore.dll test_core test_core.exe test_imu test_imu.exe
+	$(RM) libcubecore.so libcubecore.dll test_core test_core.exe test_imu test_imu.exe test_review test_review.exe

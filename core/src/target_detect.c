@@ -109,7 +109,6 @@ void cc_detect(const cc_det_cfg_t *cfg, cc_det_ws_t *ws, const uint8_t *img, cc_
         if (img[i] < ithr) ws->mask[i >> 5] |= 1u << (i & 31);
 
     /* 3) componentes ligados -> melhor candidato */
-    blob_t aborted[4]; int n_ab = 0;
     float best_score = -1.0f; blob_t bb = {0}; float bb_ring = 0, bb_in = 0;
     int cand = 0;
 
@@ -117,10 +116,6 @@ void cc_detect(const cc_det_cfg_t *cfg, cc_det_ws_t *ws, const uint8_t *img, cc_
         uint32_t m;
         while ((m = ws->mask[wi]) != 0) {
             int seed = wi * 32 + __builtin_ctz(m);
-            int sx = seed % W, sy = seed / W, skip = 0;
-            for (int k = 0; k < n_ab; k++)
-                if (sx >= aborted[k].x0 && sx <= aborted[k].x1 && sy >= aborted[k].y0 && sy <= aborted[k].y1) skip = 1;
-            if (skip) { mclr(ws, seed); continue; }
 
             blob_t b;
             flood(ws, img, seed, cfg->max_area, &b);
@@ -128,7 +123,6 @@ void cc_detect(const cc_det_cfg_t *cfg, cc_det_ws_t *ws, const uint8_t *img, cc_
             if (b.overflow == 2) return;
 
             if (b.overflow || b.area > cfg->max_area) {
-                if (n_ab < 4) aborted[n_ab++] = b;
                 continue;
             }
             if (b.area < cfg->min_area) continue;

@@ -32,6 +32,9 @@ uint32_t moteus_can_id(uint8_t src, uint8_t dst, int want_reply)
 
 size_t moteus_pack_velocity(uint8_t *buf, float vel, float max_torque, float accel, int q)
 {
+    if (!buf) return 0;
+    if (!isfinite(vel) || !isfinite(max_torque) || !isfinite(accel) ||
+        max_torque < 0.0f || accel < 0.0f) return moteus_pack_stop(buf, q);
     uint8_t *p = buf;
     *p++ = 0x01; *p++ = 0x00; *p++ = 10;                 /* modo = posição */
     *p++ = 0x0c; *p++ = 6; *p++ = 0x20;                  /* 6 floats a partir de 0x020 */
