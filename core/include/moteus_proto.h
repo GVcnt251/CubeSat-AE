@@ -23,6 +23,7 @@ uint32_t moteus_can_id(uint8_t src, uint8_t dst, int want_reply);
 
 /* Modo posição com posição=NaN (= controlo de velocidade), + pedido de estado. Devolve nº de bytes
  * (já preenchido com NOP até um comprimento CAN-FD válido). buf >= 64 bytes. */
+/* Invalid numeric arguments produce a STOP frame (same query setting). */
 size_t moteus_pack_velocity(uint8_t *buf, float vel_rev_s, float max_torque_nm, float accel_rev_s2, int query);
 size_t moteus_pack_stop(uint8_t *buf, int query);
 
