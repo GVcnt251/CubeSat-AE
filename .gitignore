@@ -5,3 +5,10 @@ firmware/build/
 firmware/sdkconfig
 firmware/managed_components/
 cubo_*.csv
+
+# Artefactos locais da simulacao
+*.pyc
+*.log
+core/test_core.exe
+core/test_imu.exe
+core/test_review.exe

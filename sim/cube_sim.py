@@ -59,6 +59,7 @@ class SimParams:
     cam_noise: float = 3.0
     poster_level: float = 215.0
     dot_level: float = 25.0
+    distractor: bool = False
     # mão que empurra o cubo
     hand_kp: float = 10.0
     hand_kd: float = 0.3
@@ -92,6 +93,7 @@ class CubeSim:
         self.v_c = 0.0
         self.i_int = 0.0
         self.tau_m = 0.0
+        self.external_torque_nm = 0.0
 
         # cenário (funções do tempo)
         self.target_fn = lambda t: 0.0       # rumo do alvo (rad)
@@ -160,7 +162,7 @@ class CubeSim:
                 else:
                     s, ds = _min_jerk((self.t - t0) / T)
                     tau_ext = p.hand_kp * (th0 + d * s - self.psi) + p.hand_kd * (d * ds / T - self.w)
-            wd = (-tau_w + f_g + tau_ext) / p.J_b
+            wd = (-tau_w + f_g + tau_ext + self.external_torque_nm) / p.J_b
         Omd = tau_w / p.J_w - wd
 
         self.w += wd * dt
@@ -220,13 +222,21 @@ class CubeSim:
             return np.clip(8.0 + 2.0 * n, 0, 255).astype(np.uint8)
 
         L = float(self.light_fn(t))
-        e = self.target_fn(t) - self.psi
+        delta = self.target_fn(t) - self.psi
+        e = math.atan2(math.sin(delta), math.cos(delta))
+        in_front = abs(e) < math.pi / 2
         du = p.f_px * math.tan(max(-1.45, min(1.45, e)))
         dv = p.f_px * math.tan(self.th)
         cr, sr = math.cos(self.phi), math.sin(self.phi)
         u = IMG_W / 2 - 0.5 + du * cr - dv * sr
         v = IMG_H / 2 - 0.5 + du * sr + dv * cr
-        self.truth_px = (u, v)
+        if getattr(self, 'three_axis_camera', False):
+            direction = self._dcm().T @ np.array([math.cos(self.target_fn(t)), math.sin(self.target_fn(t)), 0.0])
+            in_front = direction[0] > 1e-6
+            depth = max(1e-6, direction[0])
+            u = 159.5 + p.f_px * direction[1] / depth
+            v = 119.5 + p.f_px * direction[2] / depth
+        self.truth_px = (u, v) if in_front else (math.nan, math.nan)
 
         img = p.poster_level * L * self._vignette * self._grad
 
@@ -237,12 +247,15 @@ class CubeSim:
             img = img * (1.0 - sh["depth"] * np.exp(-s * s))
 
         # barra distractora (título do poster): fina e comprida, fixa em relação ao ponto
-        bar = (np.abs(self._X - u) < 38) & (np.abs(self._Y - (v - 62)) < 3.5)
-        img = np.where(bar, p.dot_level * 1.6 * L, img)
+        if p.distractor:
+            bar = in_front & (np.abs(self._X - u) < 38) & (np.abs(self._Y - (v - 62)) < 3.5)
+            img = np.where(bar, p.dot_level * 1.6 * L, img)
 
         # ponto com bordo suave (anti-aliasing)
         dist = np.sqrt((self._X - u) ** 2 + (self._Y - v) ** 2)
         alpha = np.clip(p.dot_r_px + 0.5 - dist, 0.0, 1.0)
+        if not in_front:
+            alpha.fill(0)
         img = img * (1.0 - alpha) + (p.dot_level * L) * alpha
 
         img = img + p.cam_noise * n * (0.5 + img / 255.0)

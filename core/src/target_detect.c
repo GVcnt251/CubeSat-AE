@@ -28,7 +28,6 @@ void cc_det_cfg_default(cc_det_cfg_t *c)
     c->min_bg       = 60;
 }
 
-/* Preenche o blob a partir de uma semente (4-conectividade, pilha explícita). */
 static void flood(cc_det_ws_t *ws, const uint8_t *img, int seed, int max_area, blob_t *b)
 {
     int sp = 0;
@@ -48,7 +47,7 @@ static void flood(cc_det_ws_t *ws, const uint8_t *img, int seed, int max_area, b
         if (x > b->x1) b->x1 = x;
         if (y < b->y0) b->y0 = y;
         if (y > b->y1) b->y1 = y;
-        if (b->area > max_area) b->overflow = 1;   /* continua a limpar, mas já é lixo */
+        if (b->area > max_area) b->overflow = 1;
 
         int nb[4] = { x > 0 ? idx - 1 : -1, x < W - 1 ? idx + 1 : -1,
                       y > 0 ? idx - W : -1, y < H - 1 ? idx + W : -1 };
@@ -62,7 +61,6 @@ static void flood(cc_det_ws_t *ws, const uint8_t *img, int seed, int max_area, b
     }
 }
 
-/* Média de um anel a 'off' px da bbox. Devolve nº de amostras; n_dark = amostras < thr. */
 static int ring_stats(const uint8_t *img, const blob_t *b, int off, float thr, float *mean, int *n_dark)
 {
     int x0 = b->x0 - off, x1 = b->x1 + off, y0 = b->y0 - off, y1 = b->y1 + off;
@@ -86,7 +84,7 @@ void cc_detect(const cc_det_cfg_t *cfg, cc_det_ws_t *ws, const uint8_t *img, cc_
         cfg->min_area <= 0 || cfg->max_area < cfg->min_area || cfg->max_area > CC_IMG_N)
         return;
 
-    /* 1) histograma (subamostrado 2x2); fundo = percentil 90 (robusto a sombras e ao ponto) */
+    /* 1) histograma (subamostrado 2x2); adapta se houver ecrã brilhante numa sala escura */
     uint32_t hist[256];
     memset(hist, 0, sizeof(hist));
     uint32_t total = 0;
@@ -94,11 +92,18 @@ void cc_detect(const cc_det_cfg_t *cfg, cc_det_ws_t *ws, const uint8_t *img, cc_
         const uint8_t *row = img + y * W;
         for (int x = 0; x < W; x += 2) { hist[row[x]]++; total++; }
     }
-    uint32_t acc = 0, target = total - total / 10;
-    int bg = 255;
-    for (int v = 0; v < 256; v++) { acc += hist[v]; if (acc >= target) { bg = v; break; } }
-    if (bg < cfg->min_bg) return;             /* cena demasiado escura / câmara tapada */
+    uint32_t acc = 0, target90 = total - total / 10, target97 = total - total / 33;
+    int bg90 = 255, bg97 = 255;
+    for (int v = 0; v < 256; v++) {
+        acc += hist[v];
+        if (bg90 == 255 && acc >= target90) bg90 = v;
+        if (bg97 == 255 && acc >= target97) { bg97 = v; break; }
+    }
+    int bg = bg90;
+    if (bg97 >= cfg->min_bg && bg97 > bg90 + 40 && (int)(0.85f * bg97) > bg)
+        bg = (int)(0.85f * bg97);
     out->bg = (float)bg;
+    if (bg < cfg->min_bg) return;             /* câmara tapada / cena escura */
     float thr = (float)bg * cfg->dark_ratio;
     out->threshold = thr;
 
@@ -129,19 +134,21 @@ void cc_detect(const cc_det_cfg_t *cfg, cc_det_ws_t *ws, const uint8_t *img, cc_
             cand++;
 
             int bw = b.x1 - b.x0 + 1, bh = b.y1 - b.y0 + 1;
-            if (b.x0 == 0 || b.y0 == 0 || b.x1 == W - 1 || b.y1 == H - 1) continue;  /* cortado pela borda */
+            if (b.x0 == 0 || b.y0 == 0 || b.x1 == W - 1 || b.y1 == H - 1) continue;
             float aspect = bw > bh ? (float)bw / bh : (float)bh / bw;
             float fill = (float)b.area / (float)(bw * bh);
             if (aspect > cfg->max_aspect || fill < cfg->min_fill || fill > cfg->max_fill) continue;
 
             float ring; int nd;
             int ns = ring_stats(img, &b, 4, thr, &ring, &nd);
-            if (ns < 8 || nd * 10 > ns) continue;           /* vizinhança tem de ser clara e limpa */
+            if (ns < 8 || nd * 10 > ns) continue;
             float inner = (float)b.sum_i / (float)b.area;
             float contrast = ring - inner;
             if (contrast < cfg->min_contrast || contrast < cfg->min_rel_contrast * ring) continue;
 
-            float circ = 1.0f - 2.0f * fabsf(fill - 0.785f);
+            float fill_delta = fill - 0.785f;
+            if (fill_delta < 0.0f) fill_delta = -fill_delta;
+            float circ = 1.0f - 2.0f * fill_delta;
             float score = contrast * (circ > 0.1f ? circ : 0.1f);
             if (score > best_score) { best_score = score; bb = b; bb_ring = ring; bb_in = inner; }
         }
@@ -149,9 +156,9 @@ void cc_detect(const cc_det_cfg_t *cfg, cc_det_ws_t *ws, const uint8_t *img, cc_
     out->n_cand = (uint8_t)(cand > 255 ? 255 : cand);
     if (best_score < 0.0f) return;
 
-    /* 4) centroide sub-pixel: peso = quanto abaixo do meio-termo entre fundo e interior */
+    /* 4) centroide sub-pixel */
     float mid = 0.5f * (bb_ring + bb_in);
-    float sw = 0, sx = 0, sy = 0;                  /* float: o ESP32-S3 só tem FPU de precisão simples */
+    float sw = 0, sx = 0, sy = 0;
     int ex = 2;
     for (int y = bb.y0 - ex; y <= bb.y1 + ex; y++) {
         if (y < 0 || y >= H) continue;

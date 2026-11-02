@@ -50,6 +50,7 @@ void cc_config_default(cc_config_t *g)
     g->wheel_accel = 800.0f;
 
     g->t_lock = 0.30f; g->t_search = 5.0f; g->search_rate = 0.35f;
+    g->search_span_known = 0.349066f; g->search_span_unknown = 2.792527f;
 }
 
 void cc_init(cc_t *c, const cc_config_t *cfg)
@@ -143,7 +144,9 @@ static void finish_calibration(cc_t *c)
     if (c->imu_recal_requested) c->imu_recal_required = 0;
     c->imu_recal_requested = 0;
     c->calibrated = 1; c->target_valid = 0; c->h_count = 0; c->h_head = 0;
+    c->last_cam_us = 0;
     c->rate_I = 0; c->w_ref_prev = 0;
+    c->unloading = c->unload_returning = 0; c->unload_offset = 0;
     c->mode = CC_MODE_IDLE; c->trk = CC_TRK_NONE;
 }
 
@@ -280,7 +283,7 @@ int cc_on_detection(cc_t *c, uint64_t t_capture_us, uint64_t now_us, const cc_de
     }
 
     float psi_c, e_c; hist_get(c, t_capture_us, &psi_c, &e_c);
-    float y = z - e_c;
+    float y = wrapf(z - e_c);
     if (fabsf(y) > c->cfg.cam_gate) {
         if (++c->rejects >= 5) {             /* 5 rejeições seguidas: o modelo perdeu-se */
             c->target_valid = 0;
@@ -321,6 +324,7 @@ static void update_tlm(cc_t *c, uint64_t now_us, const cc_meas_t *m,
         | (fabsf(t->wheel_rps) > 0.95f * g->wheel_lim ? CC_FLAG_WHEEL_SAT : 0)
         | (c->mag_ok ? CC_FLAG_MAG_OK : 0)
         | (c->calibrated ? CC_FLAG_CALIBRATED : 0)
+             | (c->unloading ? CC_FLAG_UNLOADING : 0)
         | (fabsf(c->roll) > PI_F/18.0f || fabsf(c->pitch) > PI_F/18.0f ? CC_FLAG_TILT_HIGH : 0));
     t->heading = c->x[0] - c->psi_zero;
     t->rate = c->gyro_z - c->x[1]; t->bias = c->x[1];
@@ -381,7 +385,7 @@ static void step_valid(cc_t *c, uint64_t now_us, const cc_meas_t *m, cc_out_t *o
         hist_push(c, now_us);
         w_hat = gz - c->x[1];
 
-        if (c->entering_track) { c->entering_track = 0; c->track_entry_us = now_us; }
+        if (c->entering_track) { c->entering_track = 0; c->track_entry_us = now_us; c->trk = CC_TRK_NONE; }
 
         int closed_loop = 0;
         if (c->mode != CC_MODE_TRACK) c->trk = CC_TRK_NONE;
@@ -401,6 +405,7 @@ static void step_valid(cc_t *c, uint64_t now_us, const cc_meas_t *m, cc_out_t *o
             break;
         case CC_MODE_TRACK: {
             closed_loop = 1;
+            cc_trk_t previous_trk = c->trk;
             double since = c->target_valid ? US(now_us - c->last_cam_us) : US(now_us - c->track_entry_us);
             if (c->target_valid && since < g->t_lock) c->trk = CC_TRK_LOCKED;
             else if (c->target_valid && since < g->t_search) c->trk = CC_TRK_COAST;
@@ -408,15 +413,59 @@ static void step_valid(cc_t *c, uint64_t now_us, const cc_meas_t *m, cc_out_t *o
             else c->trk = CC_TRK_SEARCH;
 
             if (c->trk == CC_TRK_LOCKED || c->trk == CC_TRK_COAST) {
-                err = (c->x[2] - c->x[0]) - c->aim;
+                err = wrapf((c->x[2] - c->x[0]) - c->aim);
                 w_ref = bounded_float((double)g->k_theta * err);
                 c->search_dir = err >= 0 ? 1.0f : -1.0f;
             } else if (c->trk == CC_TRK_SEARCH) {
+                if (previous_trk != CC_TRK_SEARCH) {
+                    c->search_center = c->last_cam_us ? c->x[0] + wrapf(c->x[2] - c->x[0]) : c->x[0];
+                    c->search_span = c->last_cam_us ? g->search_span_known : g->search_span_unknown;
+                }
+                c->search_rot = c->x[0] - c->search_center;
+                if (c->search_rot >= c->search_span) c->search_dir = -1.0f;
+                else if (c->search_rot <= -c->search_span) c->search_dir = 1.0f;
                 w_ref = c->search_dir * g->search_rate;
             }
             break;
         }
         default: break;  /* IDLE */
+        }
+
+        /* Pequenos ciclos de atitude transferem momento para o atrito externo do gimbal.
+         * Nenhum estado da roda é reposto: a descarga resulta da dinâmica corpo+roda+apoio.
+         * O erro transmitido continua a ser o erro real de apontamento, sem este desvio. */
+        int position_control = c->mode == CC_MODE_HEADING || (c->mode == CC_MODE_TRACK &&
+                               (c->trk == CC_TRK_LOCKED || c->trk == CC_TRK_COAST));
+        if (g->gimbal_unload && position_control) {
+            float wheel = fabsf(m->wheel_rps);
+            if (!c->unloading && wheel > 0.65f * g->wheel_lim) {
+                c->unloading = 1; c->unload_returning = 0; c->unload_offset = 0;
+                c->unload_dir = m->wheel_rps >= 0 ? 1.0f : -1.0f;
+            }
+            if (c->unloading) {
+                if (wheel < 0.45f * g->wheel_lim) c->unload_returning = 1;
+                if (fabsf(err) > 0.05236f || fabsf(w_hat) > 0.35f) {
+                    c->unload_offset = 0; c->unload_returning = 0;
+                } else {
+                    float before = c->unload_offset;
+                    if (!c->unload_returning) {
+                        c->unload_offset += c->unload_dir * 0.01f * dt;
+                        if (fabsf(c->unload_offset) >= 0.021817f) { /* 1,25° */
+                            c->unload_offset = c->unload_dir * 0.021817f; c->unload_returning = 1;
+                        }
+                    } else {
+                        float delta = 0.15f * dt;
+                        if (fabsf(c->unload_offset) <= delta) {
+                            c->unload_offset = 0; c->unload_returning = 0;
+                            if (wheel < 0.45f * g->wheel_lim) c->unloading = 0;
+                            c->unload_dir = m->wheel_rps >= 0 ? 1.0f : -1.0f;
+                        } else c->unload_offset -= c->unload_dir * delta;
+                    }
+                    w_ref += g->k_theta * c->unload_offset + (c->unload_offset - before) / dt;
+                }
+            }
+        } else {
+            c->unloading = c->unload_returning = 0; c->unload_offset = 0;
         }
 
         if (closed_loop) {
@@ -431,7 +480,13 @@ static void step_valid(cc_t *c, uint64_t now_us, const cc_meas_t *m, cc_out_t *o
             float I_new = g->rate_ki > 0.0f ? bounded_float((double)c->rate_I + (double)e_w * dt) : 0.0f;
             double cmd_old = -((double)g->rate_kp * e_w + (double)g->rate_ki * c->rate_I);
             double cmd_new = -((double)g->rate_kp * e_w + (double)g->rate_ki * I_new);
-            if (fabs(cmd_new) <= g->wheel_lim || fabs(cmd_new) < fabs(cmd_old)) c->rate_I = I_new;
+            /* Não acumular I ao tentar contrariar uma rotação externa muito acima da referência admissível.
+             * P continua a reagir; a integração retoma quando o movimento volta à gama controlável. */
+            float disturbance_limit = fmaxf(1.5f * g->w_ref_max, g->w_ref_max + 0.35f);
+            int opposing_fast = w_hat * c->w_ref_prev <= 0.0f && fabsf(w_hat) > fmaxf(0.1f * g->w_ref_max, 0.10f);
+            int imposed_motion = (c->mode == CC_MODE_TRACK || c->mode == CC_MODE_HEADING)
+                                 && (fabsf(w_hat) > disturbance_limit || opposing_fast);
+            if (!imposed_motion && (fabs(cmd_new) <= g->wheel_lim || fabs(cmd_new) < fabs(cmd_old))) c->rate_I = I_new;
             out->wheel_cmd_rps = clampf(bounded_float(-((double)g->rate_kp * e_w + (double)g->rate_ki * c->rate_I)), -g->wheel_lim, g->wheel_lim);
         } else {
             /* seguimento sem salto (bumpless) para quando se fechar a malha */
@@ -515,6 +570,25 @@ void cc_step(cc_t *c, uint64_t now_us, const cc_meas_t *m, cc_out_t *out)
 }
 
 void cc_get_tlm(const cc_t *c, cc_tlm_t *out) { *out = c->tlm; }
+
+int cc_set_camera_model(cc_t *c, float fx, float fy)
+{
+    if (!isfinite(fx) || !isfinite(fy) || fx <= 0 || fy <= 0) return 0;
+    c->cfg.cam_fx = fx; c->cfg.cam_fy = fy; return 1;
+}
+void cc_clear_target(cc_t *c) { c->target_valid = 0; c->rejects = 0; c->track_entry_us = c->last_us; }
+int cc_point_absolute(cc_t *c, float heading)
+{
+    if (!c->calibrated || !isfinite(heading)) return 0;
+    c->heading_sp = wrapf(heading - c->psi_zero);
+    c->aim = 0; c->mode = CC_MODE_HEADING; return 1;
+}
+int cc_set_search_limits(cc_t *c, float known_span, float unknown_span)
+{
+    if (!isfinite(known_span) || !isfinite(unknown_span) || known_span <= 0 || unknown_span < known_span || unknown_span > PI_F) return 0;
+    c->cfg.search_span_known = known_span; c->cfg.search_span_unknown = unknown_span; return 1;
+}
+void cc_set_gimbal_unload(cc_t *c, int enabled) { c->cfg.gimbal_unload = enabled != 0; }
 
 /* ------------------------------------------------------------ ligação ctypes */
 cc_t *cc_create(void) { cc_t *c = (cc_t *)malloc(sizeof(cc_t)); if (c) cc_init(c, NULL); return c; }

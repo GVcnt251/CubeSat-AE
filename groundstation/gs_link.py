@@ -11,6 +11,7 @@ class Link:
     def __init__(self):
         self.parser = P.Parser()
         self.asm = P.ImageAssembler()
+        self.video = P.VideoAssembler()
         self.seq = 0
         self.connected = False
         self.n_rx = self.n_tx = 0
@@ -28,6 +29,14 @@ class Link:
         try:
             if type_ == P.TM_STATE:
                 return ("state", P.decode_state(payload))
+            if type_ == P.TM_SIM3:
+                return ('sim3', P.decode_sim3(payload))
+            if type_ == P.TM_GIMBAL:
+                return ('gimbal', P.decode_gimbal(payload))
+            if type_ == P.TM_CAMERA:return ('camera',P.decode_camera(payload))
+            if type_ == P.TM_VIDEO:
+                video=self.video.feed(payload)
+                return ('video',video) if video else None
             if type_ == P.TM_VISION:
                 return ("vision", P.decode_vision(payload))
             if type_ == P.TM_IMG:
@@ -54,6 +63,7 @@ class UdpLink(Link):
         super().__init__()
         self.addr = (host, port)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET,socket.SO_RCVBUF,1024*1024)
         self.sock.setblocking(False)
         self.connected = True
 
