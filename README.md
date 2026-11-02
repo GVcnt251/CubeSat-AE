@@ -1,3 +1,81 @@
+# CubeSat v9 — correção da saturação no simulador inicial
+
+Abre **INICIAR_SIMULACAO.bat**. A versão corrige a acumulação excessiva do integrador durante empurrões, limita a procura alternando o sentido e ativa gestão de momento que usa o atrito físico do gimbal. A interface mostra **Alívio de momento** quando atua. Os limites continuam em 3000 rpm; as rodas não são repostas a zero.
+
+Validado com 32 empurrões de +20° no mesmo sentido (pico 2196 rpm) e com oclusão de 50 s (pico das rodas ~318 rpm, com readquisição). Ver `results/saturation_v9.png`, **VERIFICACAO.md** e **COMO_EXECUTAR.md** para condições, pequenas excursões de alívio e limites do modelo.
+
+```powershell
+python sim/test_saturation.py
+```
+
+O modo Webcam da versão anterior mantém-se em **INICIAR_WEBCAM.bat**, com vídeo a cores, alvo exclusivamente real e botão de centrar. A rotina de alívio é específica do gimbal com atrito; não representa descarregamento de rodas num satélite isolado em órbita.
+
+---
+
+## Histórico da versão anterior
+
+# CubeSat v8 — webcam a cores e regresso ao centro
+
+Abre **INICIAR_WEBCAM.bat** para uma sessão só de webcam: nunca aparece um alvo sintético, nem antes de a câmara abrir. O seguimento aguarda pelo ponto real no papel. O vídeo é apresentado a cores, com deteção de uma marca preta em superfície clara.
+
+**CENTRAR NA WEBCAM** comanda as rodas para voltar à direção central e mantê-la. **FIXAR ALVO** retoma o seguimento do papel. Estes comandos não movem o CubeSat por imposição gráfica nem mudam a referência de repouso do gimbal.
+
+Guia: **COMO_EXECUTAR.md**. A cena sintética continua separada em **INICIAR_SIMULACAO.bat**. Os testes de vídeo usam imagens geradas, sem abrir uma webcam pessoal.
+
+---
+
+## Histórico da versão anterior
+
+# CubeSat v7 — webcam do computador e papel com ponto preto
+
+Abre **INICIAR_WEBCAM.bat** para usar o papel real. O suporte OpenCV é instalado na primeira utilização, se estiver ausente. O modo sintético continua disponível em **INICIAR_SIMULACAO.bat**. Guia completo: **COMO_EXECUTAR.md**.
+
+A webcam fixa deteta o círculo no vídeo completo. O simulador transforma essa medida para a orientação do CubeSat, calcula os comandos das rodas e mostra uma vista virtual do vídeo. As três rodas, o gimbal e os sensores de atitude continuam simulados. O modelo óptico tem campo de visão configurável, inicialmente aproximado.
+
+```powershell
+python -m pip install -r requirements-webcam.txt
+python iniciar_simulacao.py --webcam
+```
+
+Testes sem ligar qualquer webcam: `python sim/test_webcam.py` e `python sim/test_webcam_udp.py`. Usam vídeo gerado localmente, incluindo o percurso completo de controlo e vídeo até à GUI. Não foi utilizada imagem pessoal para os validar.
+
+---
+
+## Histórico da versão anterior
+
+# CubeSat v6 — gimbal, gravidade e referência de repouso
+
+Lê **COMO_EXECUTAR.md** para abrir e usar esta versão. A montagem mantém o pivô fixo, inclui gravidade e permite configurar massa/centro de massa nas definições avançadas. O CM começa no pivô por indicação do utilizador; 1 kg é apenas um valor de exemplo.
+
+A animação mostra o gimbal, a vertical, o CM e a orientação inicial tracejada. Debaixo do modelo aparecem roll/pitch/yaw relativos e os ângulos dos planos XY/XZ/YZ, continuamente. A referência inicial é independente da calibração dos sensores.
+
+```powershell
+python iniciar_simulacao.py
+python sim/test_gimbal.py
+```
+
+O núcleo dos controladores continua partilhado. `sim/gimbal.py` calcula carga gravítica e geometria de referência; a dinâmica inercial continua aproximada por eixo. O firmware real de três rodas continua por integrar/validar.
+
+---
+
+## Histórico da versão anterior
+
+# CubeSat v5 — Mission Control e simulação de três rodas
+
+A versão atual abre a estação de terra com três rodas e empurrões horizontal/vertical personalizados. Consulta **COMO_EXECUTAR.md** para abrir, usar e conhecer os limites do modelo.
+
+```powershell
+python iniciar_simulacao.py
+```
+
+O ecrã principal apresenta FIXAR ALVO, IDLE, RECALIBRAR, câmara, modelo 3D, erros e resposta das três rodas. Ganhos, pontaria, iluminação e diagnóstico ficam em Definições avançadas. O alvo é fixo e a câmara da demonstração não tem a barra distratora.
+
+`sim/three_axis.py` implementa três modelos corpo/roda desacoplados e três instâncias do núcleo C. `sim/test_three_axis.py` verifica os novos eixos. Os testes e o firmware originais abaixo continuam a referir-se ao modelo anterior de um eixo; não constituem validação de firmware de três rodas.
+
+---
+
+## Documentação original do modelo de um eixo
+
 # Cubo com rodas de reacção — projecto completo (simulador → firmware)
 
 Implementação do guião *"A cube that learns to point on its own"* (Avionics and Spacionics, DETI-UA 2026/27):
@@ -44,6 +122,15 @@ distractora no poster e empurrões de mão.
 Gráficos em `results/level1.png … level6.png`. Captura da estação de terra: `results/gs_screenshot.png`.
 
 ## Arranque rápido
+
+No Windows, consulta primeiro `COMO_EXECUTAR.md`. Para abrir o simulador e a janela em conjunto:
+
+```powershell
+python iniciar_simulacao.py
+```
+
+Na v3, o lançador espera pelo fim de CALIB e ativa TRACK automaticamente para centrar e manter o alvo. O botão FIXAR ALVO também ativa o controlo. A janela deve indicar Cubo v4. A interface apresenta apenas FIXAR ALVO, IDLE e RECALIBRAR.
+
 
 ```bash
 pip install -r requirements.txt

@@ -49,7 +49,8 @@ enum {
     CC_FLAG_WHEEL_SAT    = 1 << 1,
     CC_FLAG_MAG_OK       = 1 << 2,
     CC_FLAG_CALIBRATED   = 1 << 3,
-    CC_FLAG_TILT_HIGH    = 1 << 4
+    CC_FLAG_TILT_HIGH    = 1 << 4,
+    CC_FLAG_UNLOADING    = 1 << 5
 };
 
 typedef enum {
@@ -142,6 +143,8 @@ typedef struct {
     float wheel_lim, torque_max, wheel_accel;
     /* máquina de estados de seguimento */
     float t_lock, t_search, search_rate;
+    float search_span_known, search_span_unknown;
+    int gimbal_unload; /* Só quando existe atrito externo no apoio; desativado por omissão. */
     uint32_t imu_timeout_us; /* Default 50000; internal, not TMTC. */
 } cc_config_t;
 
@@ -177,6 +180,12 @@ typedef struct cc_s {
     float rate_I, w_ref_prev, w_ref_last, search_dir;
     int entering_track;
     float wheel_meas;
+
+    int cam_covered;
+    float search_rot;
+    float search_center, search_span;
+    float unload_offset, unload_dir;
+    int unloading, unload_returning;
 
     cc_tlm_t tlm;
     uint64_t imu_last_valid_us, imu_last_call_us;
@@ -217,6 +226,12 @@ int  cc_on_image(cc_t *c, uint64_t t_capture_us, uint64_t now_us, const uint8_t 
 int  cc_on_detection(cc_t *c, uint64_t t_capture_us, uint64_t now_us, const cc_det_t *det, cc_vision_t *out);
 
 void cc_get_tlm(const cc_t *c, cc_tlm_t *out);
+/* Adaptadores ópticos de SIL: não alteram estado/calibração dos sensores. */
+int cc_set_camera_model(cc_t *c, float fx, float fy);
+void cc_clear_target(cc_t *c);
+int cc_point_absolute(cc_t *c, float heading);
+int cc_set_search_limits(cc_t *c, float known_span, float unknown_span);
+void cc_set_gimbal_unload(cc_t *c, int enabled);
 
 /* Auxiliares para ligações (ctypes) */
 cc_t *cc_create(void);
