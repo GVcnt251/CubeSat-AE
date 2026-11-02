@@ -17,7 +17,6 @@ def main():
     ap.add_argument('--webcam',action='store_true')
     ap.add_argument('--camera-index',type=int,default=0)
     args = ap.parse_args()
-    if args.psi0 is None:args.psi0=0.0 if args.webcam else -30.0
     try:
         import numpy
         import PyQt5.QtWidgets
@@ -43,24 +42,34 @@ def main():
             return 1
     env = dict(os.environ, PYTHONUTF8='1')
     flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
-    with open(ROOT / 'simulador.log', 'w', encoding='utf-8') as log:
-        server_command=[sys.executable,'-u',str(ROOT/'sim/sim_server.py'),'--port',str(args.port),'--psi0',str(args.psi0)]
-        if args.webcam:server_command+=['--webcam-only']
-        server = subprocess.Popen(
-            server_command, cwd=ROOT, env=env, stdout=log,
-            stderr=subprocess.STDOUT, creationflags=flags)
-        try:
-            time.sleep(0.5)
-            if server.poll() is not None:
-                print('O simulador não arrancou. Consulta simulador.log.')
-                return 1
-            command=[sys.executable,str(ROOT/'groundstation/gs_app.py'),'--port',str(args.port),'--auto-track']
-            if args.webcam:command+=['--webcam','--camera-index',str(args.camera_index)]
-            return subprocess.call(command,cwd=ROOT,env=env)
-        finally:
-            if server.poll() is None:
-                server.terminate()
-            server.wait(timeout=5)
+    webcam = args.webcam
+    while True:
+        psi0 = args.psi0 if args.psi0 is not None else (0.0 if webcam else -30.0)
+        with open(ROOT / 'simulador.log', 'w', encoding='utf-8') as log:
+            server_command=[sys.executable,'-u',str(ROOT/'sim/sim_server.py'),'--port',str(args.port),'--psi0',str(psi0)]
+            if webcam:server_command+=['--webcam-only']
+            server = subprocess.Popen(
+                server_command, cwd=ROOT, env=env, stdout=log,
+                stderr=subprocess.STDOUT, creationflags=flags)
+            try:
+                time.sleep(0.5)
+                if server.poll() is not None:
+                    print('O simulador não arrancou. Consulta simulador.log.')
+                    return 1
+                command=[sys.executable,str(ROOT/'groundstation/gs_app.py'),'--port',str(args.port),'--auto-track','--managed-session','--camera-index',str(args.camera_index)]
+                if webcam:command+=['--webcam']
+                result = subprocess.call(command,cwd=ROOT,env=env)
+            finally:
+                if server.poll() is None:
+                    server.terminate()
+                try:
+                    server.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    server.kill()
+                    server.wait()
+        if result not in (21, 22):
+            return result
+        webcam = result == 21
 
 
 if __name__ == '__main__':

@@ -368,9 +368,11 @@ class Cube3DWidget(QtWidgets.QWidget):
 
 
 class MainWindow(QtWidgets.QMainWindow):
-    def __init__(self, link, title="Cubo - estação de terra", img_every=10, auto_track=False,webcam_only=False):
+    def __init__(self, link, title="Cubo - estação de terra", img_every=10, auto_track=False,webcam_only=False, managed_session=False):
         super().__init__()
         self.link = link
+        self.managed_session = managed_session
+        self.session_exit = 0
         self.img_every = img_every
         self.setWindowTitle(title)
         self.resize(1440, 920)
@@ -497,6 +499,41 @@ class MainWindow(QtWidgets.QMainWindow):
         lay = QtWidgets.QVBoxLayout(w)
         lay.setContentsMargins(0,0,7,0); lay.setSpacing(12)
 
+        session = QtWidgets.QGroupBox('Sessão')
+        form = QtWidgets.QVBoxLayout(session)
+        self.environment_selector = QtWidgets.QComboBox()
+        self.environment_selector.addItems(['Simulação', 'CubeSat real · em breve'])
+        self.environment_selector.model().item(1).setEnabled(False)
+        self.environment_selector.setToolTip('A ligação ao CubeSat real será integrada numa fase posterior.')
+        form.addWidget(QtWidgets.QLabel('Ambiente'))
+        form.addWidget(self.environment_selector)
+        self.source_selector = QtWidgets.QComboBox()
+        self.source_selector.addItems(['Simulação · alvo virtual', 'Webcam · alvo real'])
+        self.source_selector.setCurrentIndex(1 if self.webcam_only else 0)
+        self.source_selector.setEnabled(self.managed_session)
+        self.source_selector.setToolTip('Trocar reinicia a sessão e a calibração. Abre INICIAR_GROUNDSTATION.bat para usar esta opção.')
+        self.source_selector.currentIndexChanged.connect(self._change_session_source)
+        form.addWidget(QtWidgets.QLabel('Origem do vídeo'))
+        form.addWidget(self.source_selector)
+        session_note = QtWidgets.QLabel('As rodas e o cubo continuam simulados nos dois modos.\nTrocar de origem reinicia a sessão.')
+        session_note.setWordWrap(True)
+        session_note.setStyleSheet('color: #748398; font-size: 11px;')
+        form.addWidget(session_note)
+        lay.addWidget(session)
+
+        target = QtWidgets.QGroupBox('Cor do alvo · futuro')
+        target_layout = QtWidgets.QVBoxLayout(target)
+        self.target_color_button = QtWidgets.QPushButton('Ponto preto')
+        self.target_color_button.setCheckable(True)
+        self.target_color_button.setToolTip('Pré-visualização da seleção. Ainda não altera o detetor nem envia comandos.')
+        self.target_color_button.toggled.connect(self._preview_target_color)
+        target_layout.addWidget(self.target_color_button)
+        target_note = QtWidgets.QLabel('Seleção visual apenas. A deteção atual continua a procurar o ponto preto.')
+        target_note.setWordWrap(True)
+        target_note.setStyleSheet('color: #748398; font-size: 11px;')
+        target_layout.addWidget(target_note)
+        lay.addWidget(target)
+
         g = QtWidgets.QGroupBox("Modo"); gl = QtWidgets.QGridLayout(g)
         fix = QtWidgets.QPushButton("FIXAR ALVO — controlo automático")
         fix.setText('FIXAR ALVO'); fix.setObjectName('primary')
@@ -534,6 +571,8 @@ class MainWindow(QtWidgets.QMainWindow):
         g = QtWidgets.QGroupBox('Câmara'); vl = QtWidgets.QVBoxLayout(g)
         self.webcam_button=QtWidgets.QPushButton('Ligar webcam');self.webcam_button.setCheckable(True)
         self.webcam_button.toggled.connect(self._request_camera)
+        # Retained for camera telemetry and the legacy command-line entry point.
+        self.webcam_button.setVisible(not self.managed_session)
         vl.addWidget(self.webcam_button)
         self.cover_button = QtWidgets.QPushButton('Tapar câmara'); self.cover_button.setCheckable(True)
         self.cover_button.toggled.connect(self._cover_camera)
@@ -543,6 +582,17 @@ class MainWindow(QtWidgets.QMainWindow):
         vl.addWidget(self.lbl['motor']); vl.addWidget(self.lbl['vbat']); lay.addWidget(g)
         lay.addStretch()
         return w
+
+    def _preview_target_color(self, white):
+        self.target_color_button.setText('Ponto branco' if white else 'Ponto preto')
+
+    def _change_session_source(self, index):
+        if not self.managed_session or index == (1 if self.webcam_only else 0):
+            return
+        # The launcher owns the server. Reopening a session preserves each
+        # existing mode's semantics without changing simulation or detection.
+        self.session_exit = 21 if index == 1 else 22
+        self.close()
 
     def _cover_camera(self, covered):
         self.send(P.sim_cover, covered)
@@ -581,6 +631,10 @@ class MainWindow(QtWidgets.QMainWindow):
         form.addRow('Campo horizontal real (aproximado)',self.webcam_hfov)
         form.addRow('Campo da vista virtual',self.webcam_virtual_fov)
         b=QtWidgets.QPushButton('Ligar / reaplicar webcam')
+        if self.managed_session:
+            b.setText('Reaplicar definições da webcam')
+            b.setEnabled(self.webcam_only)
+            b.setToolTip('Para mudar de origem, usa o seletor Origem do vídeo na aba Operação.')
         b.clicked.connect(lambda:self._request_camera(True));form.addRow(b)
         self.camera_hint=QtWidgets.QLabel('Mostra um círculo preto num papel branco, sem outros círculos, ocupando boa parte da imagem. '
                                          'O vídeo fica no computador. Os ângulos dependem do campo óptico configurado.')
@@ -1005,14 +1059,16 @@ def main():
     ap.add_argument("--auto-track", action="store_true", help="fixar alvo automaticamente após calibração")
     ap.add_argument('--webcam',action='store_true')
     ap.add_argument('--camera-index',type=int,default=0)
+    ap.add_argument('--managed-session', action='store_true', help='troca de sessão gerida pelo lançador')
     a = ap.parse_args()
     app = QtWidgets.QApplication(sys.argv)
     link = SerialLink(a.serial, a.baud) if a.serial else UdpLink(a.host, a.port)
-    w = MainWindow(link, f"Cubo v9 - Proteção das rodas no gimbal  ({a.serial or f'{a.host}:{a.port}'})", img_every=a.img_every, auto_track=a.auto_track,webcam_only=a.webcam)
+    w = MainWindow(link, f"CubeSat · Ground Station · {'Webcam' if a.webcam else 'Simulação'}  ({a.serial or f'{a.host}:{a.port}'})", img_every=a.img_every, auto_track=a.auto_track,webcam_only=a.webcam,managed_session=a.managed_session)
     w.webcam_index.setValue(max(0,min(9,a.camera_index)))
     if a.webcam:QtCore.QTimer.singleShot(200,lambda:w.webcam_button.setChecked(True))
     w.show()
-    sys.exit(app.exec_())
+    result = app.exec_()
+    sys.exit(w.session_exit or result)
 
 
 if __name__ == "__main__":
