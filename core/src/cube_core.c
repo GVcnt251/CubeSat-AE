@@ -144,7 +144,8 @@ static void finish_calibration(cc_t *c)
     if (c->imu_recal_requested) c->imu_recal_required = 0;
     c->imu_recal_requested = 0;
     c->calibrated = 1; c->target_valid = 0; c->h_count = 0; c->h_head = 0;
-    c->last_cam_us = 0;
+    /* Keep camera age truthful; only forget the search prior. */
+    c->search_target_known = 0;
     c->rate_I = 0; c->w_ref_prev = 0;
     c->unloading = c->unload_returning = 0; c->unload_offset = 0;
     c->mode = CC_MODE_IDLE; c->trk = CC_TRK_NONE;
@@ -277,7 +278,7 @@ int cc_on_detection(cc_t *c, uint64_t t_capture_us, uint64_t now_us, const cc_de
         c->P[0][2] = c->P[2][0] = c->P[0][0];
         c->P[1][2] = c->P[2][1] = c->P[0][1];
         for (int k = 0; k < c->h_count; k++) c->e_hist[k] = c->x[2] - c->psi_hist[k];
-        c->target_valid = 1; c->rejects = 0; c->last_cam_us = now_us; c->cam_seen = 1; c->last_cam_capture_us = t_capture_us;
+        c->target_valid = 1; c->rejects = 0; c->last_cam_us = now_us; c->cam_seen = 1; c->last_cam_capture_us = t_capture_us; c->search_target_known = 1;
         out->accepted = 1;
         return 1;
     }
@@ -294,7 +295,7 @@ int cc_on_detection(cc_t *c, uint64_t t_capture_us, uint64_t now_us, const cc_de
     float h[3] = { -1.0f, 0.0f, 1.0f }, k[3];
     kf_update(c, h, y, c->cfg.r_cam, k);
     hist_shift(c, k[0] * y, (k[2] - k[0]) * y);
-    c->last_cam_us = now_us; c->cam_seen = 1; c->last_cam_capture_us = t_capture_us;
+    c->last_cam_us = now_us; c->cam_seen = 1; c->last_cam_capture_us = t_capture_us; c->search_target_known = 1;
     out->accepted = 1;
     return 1;
 }
@@ -418,8 +419,8 @@ static void step_valid(cc_t *c, uint64_t now_us, const cc_meas_t *m, cc_out_t *o
                 c->search_dir = err >= 0 ? 1.0f : -1.0f;
             } else if (c->trk == CC_TRK_SEARCH) {
                 if (previous_trk != CC_TRK_SEARCH) {
-                    c->search_center = c->last_cam_us ? c->x[0] + wrapf(c->x[2] - c->x[0]) : c->x[0];
-                    c->search_span = c->last_cam_us ? g->search_span_known : g->search_span_unknown;
+                    c->search_center = c->search_target_known ? c->x[0] + wrapf(c->x[2] - c->x[0]) : c->x[0];
+                    c->search_span = c->search_target_known ? g->search_span_known : g->search_span_unknown;
                 }
                 c->search_rot = c->x[0] - c->search_center;
                 if (c->search_rot >= c->search_span) c->search_dir = -1.0f;
@@ -519,6 +520,10 @@ static void imu_hold_output(cc_t *c, uint64_t now_us, const cc_meas_t *m, cc_out
         out->enable = 1;
         out->wheel_cmd_rps = clampf(c->wheel_sp, -c->cfg.wheel_lim, c->cfg.wheel_lim);
     }
+    /* Cancel the unload manoeuvre on IMU hold. Restart from zero only
+     * on a normal valid control cycle if its entry conditions still hold. */
+    c->unloading = c->unload_returning = 0;
+    c->unload_offset = c->unload_dir = 0.0f;
     c->trk = CC_TRK_NONE;
     update_tlm(c, now_us, m, out, 0.0f, 0.0f);
 }
