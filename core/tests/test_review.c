@@ -91,7 +91,60 @@ static void motor_command(void) {
     n=moteus_pack_velocity(b,10,-1,1,0);
     CHECK(n>=3 && b[2]==0);
 }
+static void recal_camera_age(void) {
+    ready();tick(1);
+    CHECK(c.tlm.cam_age_s == -1.0f);
+    cc_det_t d={0};cc_vision_t v;
+    d.found=1;d.x=200;d.y=120;d.area=100;d.contrast=180;
+    CHECK(cc_on_detection(&c,t,t,&d,&v)==1);
+    uint64_t accepted=t;
+    cmd(CC_CMD_RECAL,0,0);
+    for(int i=0;i<330;i++) tick(1);
+    CHECK(c.calibrated && c.mode==CC_MODE_IDLE);
+    CHECK(c.last_cam_us==accepted);
+    CHECK(fabsf(c.tlm.cam_age_s-(float)((t-accepted)*1e-6))<1e-5f);
+    cmd(CC_CMD_MODE,CC_MODE_TRACK,0);
+    for(int i=0;i<1020;i++) tick(1);
+    CHECK(c.trk==CC_TRK_SEARCH);
+    CHECK(c.search_span==c.cfg.search_span_unknown);
+    CHECK(cc_on_detection(&c,t,t,&d,&v)==1);
+    for(int i=0;i<1020;i++) tick(1);
+    CHECK(c.trk==CC_TRK_SEARCH && c.search_span==c.cfg.search_span_known);
+}
+static void start_unloading(void) {
+    ready();cc_set_gimbal_unload(&c,1);
+    cmd(CC_CMD_MODE,CC_MODE_HEADING,0);
+    m.wheel_rps=250;tick(1);tick(1);
+    CHECK(o.enable && c.unloading && (c.tlm.flags&CC_FLAG_UNLOADING));
+    CHECK(c.unload_offset!=0);
+}
+static void check_unload_stopped(void) {
+    CHECK(!c.unloading && !c.unload_returning && c.unload_offset==0);
+    CHECK(!(c.tlm.flags&CC_FLAG_UNLOADING));
+}
+static void unloading_imu(void) {
+    start_unloading();tick(0);
+    CHECK(!o.enable);check_unload_stopped();
+    tick(1);CHECK(!o.enable);check_unload_stopped(); /* rebase only */
+    tick(1);CHECK(o.enable && c.unloading); /* fresh restart */
+    for(int mode=CC_MODE_IDLE;mode<=CC_MODE_WHEEL;mode++) {
+        start_unloading();tick(0);cmd(CC_CMD_MODE,(float)mode,0);
+        cmd(CC_CMD_WHEEL,20,0);tick(0);check_unload_stopped();
+        CHECK(o.enable==(unsigned)(mode==CC_MODE_WHEEL));
+    }
+    start_unloading();uint64_t last=c.imu_last_valid_us;
+    t=last+50001;
+    CHECK(cc_step_with_imu(&c,t,&m,0,&o)==CC_IMU_RECAL_REQUIRED);
+    CHECK(!o.enable);check_unload_stopped();
+    tick(1);tick(1);CHECK(!o.enable && c.imu_recal_required);check_unload_stopped();
+    cmd(CC_CMD_MODE,CC_MODE_WHEEL,0);tick(0);
+    CHECK(o.enable && c.imu_recal_required);check_unload_stopped();
+    cmd(CC_CMD_RECAL,0,0);
+    for(int i=0;i<330;i++) tick(1);
+    CHECK(c.calibrated && !c.imu_recal_required);check_unload_stopped();
+}
 int main(void) {
     vision();recal_clock();motor_independence();held_tlm();detection_islands();motor_command();
+    recal_camera_age();unloading_imu();
     printf("Review regressions: %d failures\n",fails);return fails?1:0;
 }

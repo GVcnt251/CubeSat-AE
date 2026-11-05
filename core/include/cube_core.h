@@ -191,6 +191,7 @@ typedef struct cc_s {
     uint64_t imu_last_valid_us, imu_last_call_us;
     int imu_seen, imu_call_seen, imu_missing, imu_recal_required, imu_recal_requested;
     int imu_calibrated_once;
+    int search_target_known; /* Accepted target since the last calibration. */
     int cam_seen;
     uint64_t last_cam_capture_us; /* Last accepted capture: reject duplicates. */
 
