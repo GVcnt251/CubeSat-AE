@@ -85,9 +85,17 @@ static void handle_tc(uint8_t type, uint8_t seq, const uint8_t *p, uint8_t len)
 {
     uint8_t status = ACK_OK;
     if (type == TC_PING) {
-        /* só ACK */
-    } else if (type == TC_STREAM_CFG && len == 3) {
-        g_state_hz = p[0]; g_vision_hz = p[1]; g_img_every = p[2];
+    if (len != 0) {
+        status = 1;  // Erro: comprimento inválido
+    }
+} else if (type == TC_STREAM_CFG) {
+    if (len != 3) {
+        status = 1;  // Erro: comprimento inválido
+    } else {
+        g_state_hz = p[0];
+        g_vision_hz = p[1];
+        g_img_every = p[2];
+    }
     } else {
         cc_cmd_t cmd;
         int r = cc_tc_to_cmd(type, p, len, &cmd);
@@ -110,8 +118,7 @@ static void open_socket(void)
 
 void comms_task(void *arg)
 {
-    cc_parser_t parser;
-    cc_parser_init(&parser);
+    
     uint64_t next_state = 0;
     for (;;) {
         if (s_sock < 0 && s_ip_ok) open_socket();
@@ -119,19 +126,61 @@ void comms_task(void *arg)
             uint8_t rx[512];
             struct sockaddr_in from; socklen_t fl = sizeof(from);
             int n = recvfrom(s_sock, rx, sizeof(rx), MSG_DONTWAIT, (struct sockaddr *)&from, &fl);
+            
             if (n > 0) {
-                xSemaphoreTake(s_tx_mtx, portMAX_DELAY); s_client = from; s_have_client = true; xSemaphoreGive(s_tx_mtx);
-                for (int i = 0; i < n; i++)
-                    if (cc_parser_feed(&parser, rx[i])) handle_tc(parser.type, parser.seq, parser.payload, parser.len);
+                cc_parser_t parser;
+                cc_parser_init(&parser);
+
+                bool valid = false;
+
+                for (int i = 0; i < n; i++) {
+                    if (cc_parser_feed(&parser, rx[i])) {
+                        // A trama tem de terminar no último byte
+                        if (i != n - 1) {
+                            valid = false;
+                            break;
+                        }
+                        valid = true;
+                    }
+                }
+
+                // Só aceitar uma trama completa por datagrama
+                if (valid &&
+                    n == parser.len + 7 &&
+                    rx[0] == 0xA5 &&
+                    rx[1] == 0x5A &&
+                    parser.type >= TC_PING &&
+                    parser.type <= TC_RECAL) {
+
+                    // Guardar o endereço apenas após validar a trama
+                    xSemaphoreTake(s_tx_mtx, portMAX_DELAY);
+                    s_client = from;
+                    s_have_client = true;
+                    xSemaphoreGive(s_tx_mtx);
+
+                    // Processar o comando
+                    handle_tc(parser.type, parser.seq,
+                        parser.payload, parser.len);
+                }
             }
+            
             uint64_t now = (uint64_t)esp_timer_get_time();
+
             if (g_state_hz && now >= next_state) {
                 cc_tlm_t t;
-                CORE_LOCK(); cc_get_tlm(&g_core, &t); CORE_UNLOCK();
+
+                CORE_LOCK();
+                cc_get_tlm(&g_core, &t);
+                CORE_UNLOCK();
+                
                 uint8_t pl[64];
-                send_frame(TM_STATE, pl, (uint8_t)cc_pack_tm_state(pl, &t));
+
+                send_frame(TM_STATE, pl,
+                    (uint8_t)cc_pack_tm_state(pl, &t));
+
                 next_state = now + 1000000ULL / g_state_hz;
             }
+
         }
         vTaskDelay(pdMS_TO_TICKS(5));
     }
