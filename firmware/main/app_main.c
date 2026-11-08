@@ -31,7 +31,9 @@ static void control_task(void *arg)
 {
     TickType_t last = xTaskGetTickCount();
     const TickType_t period = pdMS_TO_TICKS(1000 / CONTROL_HZ);
-    uint32_t n = 0, late = 0;
+    uint32_t n = 0, late = 0, over_budget = 0;
+    uint64_t max_cycle_us = 0;
+    const uint64_t budget_us = 1000000ULL / CONTROL_HZ;
 
     #ifndef CONFIG_CUBE_WHEEL_FAKE
         uint32_t stale = 0;
@@ -87,7 +89,27 @@ static void control_task(void *arg)
             }
         } else stale = 0;
 #endif
-        if (++n % (CONTROL_HZ * 10) == 0 && late) { ESP_LOGW(TAG, "%u ciclos de controlo atrasados", (unsigned)late); late = 0; }
+        uint64_t cycle_us = (uint64_t)esp_timer_get_time() - t;
+
+        if (cycle_us > max_cycle_us) {
+            max_cycle_us = cycle_us;
+        }
+
+        if (cycle_us > budget_us) {
+            over_budget++;
+        }
+
+        if (++n % (CONTROL_HZ * 10) == 0) {
+            ESP_LOGI(TAG,
+                     "Controlo: max=%llu us, acima do periodo=%u, atrasos=%u",
+                     (unsigned long long)max_cycle_us,
+                     (unsigned)over_budget,
+                     (unsigned)late);
+
+            max_cycle_us = 0;
+            over_budget = 0;
+            late = 0;
+        }
     }
 }
 
