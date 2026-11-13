@@ -1,0 +1,23 @@
+{
+  "date": "2026-11-13",
+  "kind": "Incremental source package; optional core3 and DRAFT TMTC extension",
+  "original_snapshot_files_verified_unchanged": 200,
+  "legacy_copy_source_files_verified_identical": 37,
+  "original_dependency_sha256": {
+    "core/include/cc_proto.h": "d8a556828c0a64b407130cb142b1408c8e76d402890facdfb45fce50bf251b38",
+    "core/include/cube_core.h": "d1c0510d6202f630df3128d19ad66c9d494f043e25291001c76d5678de45db5f",
+    "core/include/moteus_proto.h": "8d732258e0759fd6c9fcf1a4529b6ad46bfe1e10c292020816408df2d40f2780",
+    "core/include/target_detect.h": "b889b6c1671a204d2e03d32b2a93e996e756158e62e2d8423a6ce34109f731a2",
+    "core/include/wire_le.h": "eca64aa70fd2d7f2e7d5c509e719254e8e49d0815a9c773dec28c27699093f95",
+    "core/src/cc_proto.c": "bfb83e749ef0efbec2ac5f03448b70fa0efb35b27e25058bfcd7f1fea171dac5",
+    "core/src/cube_core.c": "623cdf1c816e6063ef580c23ba0b1a0d3816290e85380a13adbf261d77881f35",
+    "core/src/moteus_proto.c": "f3b1338e126a7510c4414cb2e160981f4a5585600471ad588ec107c166027aeb",
+    "core/src/target_detect.c": "31d29b084c5763fd9204ec281637b83a2c4c50b8b35b956fbfb67b176d36750f",
+    "core/tests/test_aim_sil.py": "8f2146bccc670ca6764954220741b5827d614e17d3025f4d6aa43ec239507162",
+    "core/tests/test_core.c": "815f413a498c37e4f7df941d5de25f23d1d0c661be3f34375ce997f6035773bf",
+    "core/tests/test_imu.c": "94a9f75ad7362e7afb67478567b799ee8db2a37efa677e3d49a83e274c41d5ef",
+    "core/tests/test_review.c": "19a6883d8696352194106fb04de9396c1fc5e25f4b59c0e5334c8fe3476471e4",
+    "core/Makefile": "1a75261ed1564cad782988961e2a86ce4760a60d73b194be4fb02a55a9c85105"
+  },
+  "only_preexisting_file_replaced_by_package": "core/Makefile"
+}
