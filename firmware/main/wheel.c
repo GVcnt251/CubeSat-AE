@@ -53,12 +53,19 @@ typedef struct {
     bool motor_fault;
 } wheel_runtime_t;
 
-static wheel_runtime_t s_wheel;
+enum {
+    WHEEL_AXIS_X = 0,
+    WHEEL_AXIS_Y,
+    WHEEL_AXIS_Z,
+    WHEEL_AXIS_COUNT
+};
+
+static wheel_runtime_t s_wheels[WHEEL_AXIS_COUNT];
 static bool s_can_ok;
 
 int wheel_init(void)
 {
-    memset(&s_wheel, 0, sizeof(s_wheel));
+    memset(s_wheels, 0, sizeof(s_wheels));
 
     s_can_ok = can_port_init() == ESP_OK;
     return s_can_ok ? 0 : -1;
@@ -66,9 +73,11 @@ int wheel_init(void)
 
 wheel_state_t wheel_update(const cc_out_t *c)
 {
+    wheel_runtime_t *const wheel = &s_wheels[WHEEL_AXIS_Z];
+
     if (!s_can_ok) {
-        s_wheel.state.valid = false;
-        return s_wheel.state;
+        wheel->state.valid = false;
+        return wheel->state;
     }
 
     const float sign =
@@ -87,34 +96,34 @@ wheel_state_t wheel_update(const cc_out_t *c)
         }
 
         if (st.have_motion) {
-            s_wheel.state.vel_rps = sign * st.velocity_rev_s * TWO_PI;
-            s_wheel.state.torque_nm = sign * st.torque_nm;
+            wheel->state.vel_rps = sign * st.velocity_rev_s * TWO_PI;
+            wheel->state.torque_nm = sign * st.torque_nm;
         }
 
         if (st.have_aux) {
-            s_wheel.state.vbat_v = st.voltage_v;
+            wheel->state.vbat_v = st.voltage_v;
 
             bool fault = st.fault != 0;
-            if (fault && !s_wheel.motor_fault) {
+            if (fault && !wheel->motor_fault) {
                 ESP_LOGE(TAG, "moteus em falha: código %u", st.fault);
             }
-            s_wheel.motor_fault = fault;
+            wheel->motor_fault = fault;
         }
 
         if (st.have_mode && st.have_motion && st.have_aux) {
-            s_wheel.last_reply_us = (uint64_t)esp_timer_get_time();
-            s_wheel.have_reply = true;
+            wheel->last_reply_us = (uint64_t)esp_timer_get_time();
+            wheel->have_reply = true;
         }
     }
 
-    s_wheel.state.valid = s_wheel.have_reply && !s_wheel.motor_fault &&
-        ((uint64_t)esp_timer_get_time() - s_wheel.last_reply_us < 50000);
+    wheel->state.valid = wheel->have_reply && !wheel->motor_fault &&
+        ((uint64_t)esp_timer_get_time() - wheel->last_reply_us < 50000);
 
     /* Sem estado válido, enviar STOP com pedido de resposta. */
     uint8_t buf[64];
     size_t n;
 
-    if (c->enable && s_wheel.state.valid) {
+    if (c->enable && wheel->state.valid) {
         n = moteus_pack_velocity(
             buf,
             sign * c->wheel_cmd_rps / TWO_PI,
@@ -132,11 +141,11 @@ wheel_state_t wheel_update(const cc_out_t *c)
     memcpy(f.data, buf, n);
 
     if (can_port_send(&f) != ESP_OK) {
-        s_wheel.state.valid = false;
-        s_wheel.have_reply = false;
+        wheel->state.valid = false;
+        wheel->have_reply = false;
     }
 
-    return s_wheel.state;
+    return wheel->state;
 }
 
 #endif
