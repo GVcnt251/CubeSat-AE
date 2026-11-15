@@ -5,7 +5,6 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
-static cc_t core;
 static uint8_t img[CC_IMG_N];
 static cc_det_ws_t ws;
 
@@ -56,45 +55,6 @@ static void protocol(void) {
     puts("OK: TMTC, CRC, lengths, validation and image chunks");
 }
 
-static void control(void) {
-    cc_init(&core,NULL);
-    cc_meas_t m={0}; m.accel[2]=9.81f; cc_out_t out;
-    for (uint64_t t=0;t<=1600000;t+=5000) cc_step(&core,t,&m,&out);
-    assert(core.calibrated && core.mode==CC_MODE_IDLE);
-    cc_cmd_t cmd={CC_CMD_GAIN,CC_GAIN_RATE_KI,0,0}; cc_command(&core,&cmd);
-    cc_step(&core,1605000,&m,&out);
-    assert(core.rate_I==0 && isfinite(out.wheel_cmd_rps));
-    cmd.type=CC_CMD_MODE; cmd.a=CC_MODE_RATE; cc_command(&core,&cmd);
-    cmd.type=CC_CMD_RATE; cmd.a=0.2f; cc_command(&core,&cmd);
-    cc_step(&core,1610000,&m,&out);
-    assert(out.enable && isfinite(out.wheel_cmd_rps) && out.wheel_cmd_rps<0);
-    float x=core.x[0];
-    m.gyro[2]=NAN; cc_step(&core,1615000,&m,&out);
-    assert(!out.enable && core.x[0]==x);
-    m.gyro[2]=0; cc_step(&core,1600000,&m,&out);
-    assert(!out.enable && core.last_us==1610000);
-    cmd.type=CC_CMD_MODE; cmd.a=1e30f; cc_command(&core,&cmd);
-    assert(core.mode==CC_MODE_RATE);
-    cmd.type=CC_CMD_HEADING; cmd.a=1e30f; cc_command(&core,&cmd);
-    cmd.type=CC_CMD_MODE; cmd.a=CC_MODE_HEADING; cc_command(&core,&cmd);
-    cc_step(&core,1620000,&m,&out);
-    assert(!out.enable); /* first recovered sample only rebases time */
-    cc_step(&core,1625000,&m,&out);
-    assert(out.enable && isfinite(out.wheel_cmd_rps));
-    float mag[]={NAN,0,0}; cc_on_mag(&core,1620000,mag);
-    assert(!core.mag_ok && isfinite(core.x[0]));
-    cc_det_t d={0}; cc_vision_t v;
-    d.found=1; d.x=159.5f; d.y=119.5f; d.area=100; d.contrast=180;
-    assert(!cc_on_detection(&core,1625001,1625000,&d,&v));
-    assert(!cc_on_detection(&core,1,1625000,&d,&v));
-    assert(cc_on_detection(&core,1625000,1625000,&d,&v));
-    d.x=NAN; assert(!cc_on_detection(&core,1625000,1625000,&d,&v));
-    cmd.type=CC_CMD_RECAL; cc_command(&core,&cmd);
-    assert(!core.target_valid && !core.h_count && !core.entering_track && !core.calibrated);
-    assert(core.cfg.rate_ki==0 && core.mode==CC_MODE_CALIB);
-    puts("OK: calibration, zero Ki, invalid samples, timestamps and recalibration");
-}
-
 static void detector(void) {
     cc_det_cfg_t cfg; cc_det_cfg_default(&cfg); cc_det_t d;
     memset(img,220,sizeof(img));
@@ -140,4 +100,4 @@ static void motor(void) {
     }
     puts("OK: moteus reference, partial/truncated frames, varuint and malformed inputs");
 }
-int main(void) { protocol(); control(); detector(); motor(); puts("All core regression tests passed."); return 0; }
+int main(void) { protocol(); detector(); motor(); puts("All common-module regression tests passed."); return 0; }
