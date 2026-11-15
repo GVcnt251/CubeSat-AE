@@ -1,45 +1,32 @@
-# Compila o núcleo para PC (SIL). Em Windows/MSYS2 MINGW64:  make   -> libcubecore.dll
-CC      ?= gcc
+# Standalone 3-axis control; the single-axis controller is not a build input.
+CC ?= gcc
+PYTHON ?= python
 CPPFLAGS += -Iinclude
-CFLAGS  ?= -O2 -std=c99 -Wall -Wextra -Wpedantic
-SRCS     = src/target_detect.c src/cube_core.c src/cc_proto.c src/moteus_proto.c src/cube_core3.c src/cc_proto3.c
-UNAME_S := $(shell uname -s 2>/dev/null)
+CFLAGS ?= -O2 -std=c99 -Wall -Wextra -Wpedantic -Werror
+SRCS = src/cube_core3.c src/target_detect.c src/cc_proto.c src/cc_proto3.c src/moteus_proto.c
+HEADERS = $(wildcard include/*.h)
 ifeq ($(OS),Windows_NT)
-  LIB = libcubecore.dll
-else ifneq (,$(findstring MINGW,$(UNAME_S)))
-  LIB = libcubecore.dll
-else ifneq (,$(findstring MSYS,$(UNAME_S)))
-  LIB = libcubecore.dll
-else
-  LIB = libcubecore.so
-endif
-
-ifneq (,$(findstring dll,$(LIB)))
-  LDEXTRA = -static-libgcc
+  LIB = libcubecore3.dll
   EXE = .exe
+  LDEXTRA = -static-libgcc
 else
+  LIB = libcubecore3.so
   CFLAGS += -fPIC
 endif
-
-.PHONY: all test clean
+TESTS = test_common$(EXE) test_core3$(EXE) test_core3_more$(EXE)
+.PHONY: all test test-sil clean
 all: $(LIB)
-$(LIB): $(SRCS) $(wildcard include/*.h)
+$(LIB): $(SRCS) $(HEADERS)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -shared -o $@ $(SRCS) -lm $(LDEXTRA) $(LDLIBS)
-test_core$(EXE): tests/test_core.c $(SRCS) $(wildcard include/*.h)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_core.c $(SRCS) -lm $(LDEXTRA) $(LDLIBS)
-test_imu$(EXE): tests/test_imu.c $(SRCS) $(wildcard include/*.h)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_imu.c $(SRCS) -lm $(LDEXTRA) $(LDLIBS)
-test_review$(EXE): tests/test_review.c $(SRCS) $(wildcard include/*.h)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_review.c $(SRCS) -lm $(LDEXTRA) $(LDLIBS)
-test_core3$(EXE): tests/test_core3.c $(SRCS) $(wildcard include/*.h)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_core3.c $(SRCS) -lm $(LDEXTRA) $(LDLIBS)
-test_core3_more$(EXE): tests/test_core3_more.c $(SRCS) $(wildcard include/*.h)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ tests/test_core3_more.c $(SRCS) -lm $(LDEXTRA) $(LDLIBS)
-test: test_core3$(EXE) test_core3_more$(EXE) test_core$(EXE) test_imu$(EXE) test_review$(EXE)
+$(TESTS): %$(EXE): tests/%.c $(SRCS) $(HEADERS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $< $(SRCS) -lm $(LDEXTRA) $(LDLIBS)
+test: $(LIB) $(TESTS)
+	./test_common$(EXE)
 	./test_core3$(EXE)
 	./test_core3_more$(EXE)
-	./test_core$(EXE)
-	./test_imu$(EXE)
-	./test_review$(EXE)
+	$(PYTHON) tests/test_standalone.py
+test-sil: $(LIB)
+	$(PYTHON) tests/test_core3_sil.py
+	$(PYTHON) tests/test_proto3_python.py
 clean:
-	$(RM) libcubecore.so libcubecore.dll test_core test_core.exe test_imu test_imu.exe test_review test_review.exe test_core3 test_core3.exe test_core3_more test_core3_more.exe
+	$(RM) libcubecore3.dll libcubecore3.so libcubecore3_build.dll libcubecore3_build.so test_common test_common.exe test_core3 test_core3.exe test_core3_more test_core3_more.exe

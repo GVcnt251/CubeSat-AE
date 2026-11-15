@@ -1,5 +1,6 @@
 #include "cube_core3.h"
 #include <math.h>
+#include <float.h>
 #include <string.h>
 #define PI 3.14159265358979323846f
 static float limit(float x, float lo, float hi) {
@@ -90,10 +91,50 @@ static void rot_error(const float q[4], const float desired[4], float e[3]) {
   for (int i = 0; i < 3; i++)
     e[i] = d[i + 1] * k;
 }
+static void axis_config_default(cc_config_t *g)
+{
+    memset(g, 0, sizeof(*g));
+    /* câmara: 320x240, HFOV ~65.5 deg (do slide: 83.9 px <-> 18.6 deg => f = 249 px) */
+    g->cam_fx = 249.0f; g->cam_fy = 249.0f; g->cam_cx = 159.5f; g->cam_cy = 119.5f;
+    cc_det_cfg_default(&g->det);
+    g->calib_s = 1.5f;
+    g->imu_timeout_us = 50000;
+
+    g->q_psi    = 1e-7f;
+    g->q_bias   = 1e-9f;
+    g->q_target = 1e-4f;
+    g->r_mag    = 0.05f * 0.05f;          /* ~2.9 deg */
+    g->r_cam    = 0.007f * 0.007f;        /* ~0.4 deg */
+    g->cam_gate = 0.30f;
+    g->mag_nom_uT = 44.0f; g->mag_tol = 0.40f;
+    g->use_mag  = 1;
+
+    g->k_theta   = 3.0f;
+    g->rate_kp   = 5.0f;
+    g->rate_ki   = 300.0f;
+    g->w_ref_max = 0.70f;                 /* 40 deg/s */
+    g->a_ref_max = 4.0f;
+    g->wheel_lim = 314.16f;               /* 3000 rpm */
+    g->torque_max = 0.20f;
+    g->wheel_accel = 800.0f;
+
+    g->t_lock = 0.30f; g->t_search = 5.0f; g->search_rate = 0.35f;
+    g->search_span_known = 0.349066f; g->search_span_unknown = 2.792527f;
+}
+
+int cc3_gain_valid(uint32_t id, float v)
+{
+    if (id >= CC_GAIN_COUNT || !isfinite(v) || v < 0.0f) return 0;
+    if (id == CC_GAIN_USE_MAG) return v == 0.0f || v == 1.0f;
+    if (id == CC_GAIN_R_CAM || id == CC_GAIN_R_MAG)
+        return (double)v * v >= FLT_MIN && (double)v * v <= FLT_MAX;
+    return 1;
+}
+
 void cc3_config_default(cc3_config_t *g) {
   memset(g, 0, sizeof(*g));
   for (int i = 0; i < 3; i++)
-    cc_config_default(&g->axis[i]);
+    axis_config_default(&g->axis[i]);
   g->accel_kp = 1;
   g->mag_kp = 1;
   g->gravity = 9.80665f;
@@ -194,7 +235,7 @@ int cc3_command_vector(cc3_t *c, uint32_t kind, const float v[3]) {
   return 1;
 }
 int cc3_set_gain(cc3_t *c, unsigned axis, uint32_t id, float value) {
-  if (!c || axis >= 3 || !cc_gain_valid(id, value))
+  if (!c || axis >= 3 || !cc3_gain_valid(id, value))
     return 0;
   cc3_config_t g = c->cfg;
   cc_config_t *a = &g.axis[axis];
