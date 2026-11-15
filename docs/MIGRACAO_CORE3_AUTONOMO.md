@@ -2,9 +2,11 @@
 
 Data: 15/11/2026. Este documento descreve a integração a realizar nos módulos dos colegas; não afirma que o firmware ou o GUI foram migrados neste pacote.
 
+Atualização de compatibilidade: `cube_core.c/.h` foram repostos temporariamente para o firmware atual. Os tipos comuns estão em `cc_types.h` e as regras numéricas em `cc_gain_validation.h`. O build 3D continua independente. Ver `COMPATIBILIDADE_CORE_TEMPORARIA.md`.
+
 ## Pessoa 2: resultado entregue
 
-O componente entregue tem só um controlador. `cube_core3.h` inclui apenas headers de C e `target_detect.h`. Não inclui `cube_core.h`. `cube_core3.c` tem a sua configuração inicial e validador de ganhos. `cc_proto.h` passa a incluir o header autónomo; `cc_proto.c` usa `cc3_gain_valid`. Os outros algoritmos/packers existentes foram preservados.
+O alvo 3D tem só um controlador. `cube_core3.h` inclui `cc_types.h`, sem incluir `cube_core.h`. `cube_core3.c` tem a sua configuração inicial e API de validação de ganhos. `cc_proto.h` inclui apenas os tipos comuns; `cc_proto.c` usa a validação partilhada sem depender de símbolos `cc3_*` ou `cc_*` do controlador. Os algoritmos e formatos de mensagens foram preservados.
 
 O conjunto necessário à compilação é:
 
@@ -35,7 +37,7 @@ O firmware consultado ainda utiliza `cc_t`, `cc_meas_t` e funções `cc_*` do co
 
 Uma saída escalar `cc_out_t` continua a ser a interface de um motor, por isso o código do driver pode reutilizar esse tipo. É o estado de cada driver e o despacho CAN que têm de existir por roda.
 
-Atualizar em conjunto `app.h`, `app_main.c`, a tarefa da câmara, `comms.h/c` e os includes do driver. Todos os chamadores do mesmo firmware devem usar a definição nova dos tipos; não incluir simultaneamente o header antigo e o autónomo na mesma unidade de compilação, porque ambos definem nomes comuns.
+Atualizar em conjunto `app.h`, `app_main.c`, a tarefa da câmara, `comms.h/c` e os includes do driver. Os dois headers podem agora coexistir porque os tipos comuns têm uma definição única. Isso não torna `cc_t` e `cc3_t` intercambiáveis: não converter ponteiros entre os dois estados.
 
 No componente ESP-IDF, depois de migrar os chamadores, a lista de fontes passa a ser:
 

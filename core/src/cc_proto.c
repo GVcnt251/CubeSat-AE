@@ -1,4 +1,5 @@
 #include "cc_proto.h"
+#include "cc_gain_validation.h"
 #include <string.h>
 #include <math.h>
 #include "wire_le.h"
@@ -151,7 +152,7 @@ int cc_tc_to_cmd(uint8_t type, const uint8_t *pl, uint8_t len, cc_cmd_t *cmd)
         case CC_GAIN_WHEEL_LIM: v *= RPM2RPS; break;
         default: break;
         }
-        if (!cc3_gain_valid(pl[0], v)) return -ACK_BAD_ARG;
+        if (!cc_gain_value_valid(pl[0], v)) return -ACK_BAD_ARG;
         cmd->type = CC_CMD_GAIN; cmd->id = pl[0]; cmd->a = v; return 1;
     }
     case TC_PING:
