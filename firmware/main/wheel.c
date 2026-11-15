@@ -71,6 +71,31 @@ int wheel_init(void)
     return s_can_ok ? 0 : -1;
 }
 
+static void wheel_apply_reply(wheel_runtime_t *wheel,
+                              const moteus_status_t *status,
+                              float sign)
+{
+    if (status->have_motion) {
+        wheel->state.vel_rps = sign * status->velocity_rev_s * TWO_PI;
+        wheel->state.torque_nm = sign * status->torque_nm;
+    }
+
+    if (status->have_aux) {
+        wheel->state.vbat_v = status->voltage_v;
+
+        bool fault = status->fault != 0;
+        if (fault && !wheel->motor_fault) {
+            ESP_LOGE(TAG, "moteus em falha: código %u", status->fault);
+        }
+        wheel->motor_fault = fault;
+    }
+
+    if (status->have_mode && status->have_motion && status->have_aux) {
+        wheel->last_reply_us = (uint64_t)esp_timer_get_time();
+        wheel->have_reply = true;
+    }
+}
+
 wheel_state_t wheel_update(const cc_out_t *c)
 {
     wheel_runtime_t *const wheel = &s_wheels[WHEEL_AXIS_Z];
@@ -95,25 +120,7 @@ wheel_state_t wheel_update(const cc_out_t *c)
             continue;
         }
 
-        if (st.have_motion) {
-            wheel->state.vel_rps = sign * st.velocity_rev_s * TWO_PI;
-            wheel->state.torque_nm = sign * st.torque_nm;
-        }
-
-        if (st.have_aux) {
-            wheel->state.vbat_v = st.voltage_v;
-
-            bool fault = st.fault != 0;
-            if (fault && !wheel->motor_fault) {
-                ESP_LOGE(TAG, "moteus em falha: código %u", st.fault);
-            }
-            wheel->motor_fault = fault;
-        }
-
-        if (st.have_mode && st.have_motion && st.have_aux) {
-            wheel->last_reply_us = (uint64_t)esp_timer_get_time();
-            wheel->have_reply = true;
-        }
+        wheel_apply_reply(wheel, &st, sign);
     }
 
     wheel->state.valid = wheel->have_reply && !wheel->motor_fault &&
