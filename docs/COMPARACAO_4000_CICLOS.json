@@ -1,0 +1,28 @@
+{
+  "cycles_compared": 4000,
+  "bit_identical": [
+    "state",
+    "outputs",
+    "vision",
+    "TM_STATE3"
+  ],
+  "gain_validation_cases": 135,
+  "abi_sizes": {
+    "cc3_sizeof_state": [
+      2560,
+      2560
+    ],
+    "cc3_sizeof_meas": [
+      68,
+      68
+    ],
+    "cc3_sizeof_out": [
+      48,
+      48
+    ],
+    "cc3_sizeof_tlm": [
+      160,
+      160
+    ]
+  }
+}

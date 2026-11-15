@@ -12,7 +12,7 @@ import unittest
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[2]
-L = C.CDLL(str(ROOT / 'core' / ('libcubecore.dll' if sys.platform=='win32' else 'libcubecore.so')))
+L = C.CDLL(str(ROOT / 'core' / ('libcubecore3.dll' if sys.platform=='win32' else 'libcubecore3.so')))
 F3=C.c_float*3;F4=C.c_float*4
 class Meas(C.Structure):
     _fields_=[(n,F3) for n in ('gyro','accel','mag','wheel_rps','wheel_torque')]+[('vbat_v',C.c_float),('mag_valid',C.c_uint8),('motor_valid_mask',C.c_uint8)]
