@@ -10,7 +10,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
-#include "cube_core3.h"
+#include "cc_types.h"
 
 #ifdef __cplusplus
 extern "C" {
