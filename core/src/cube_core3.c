@@ -1,4 +1,5 @@
 #include "cube_core3.h"
+#include "cc_gain_validation.h"
 #include <math.h>
 #include <float.h>
 #include <string.h>
@@ -124,11 +125,7 @@ static void axis_config_default(cc_config_t *g)
 
 int cc3_gain_valid(uint32_t id, float v)
 {
-    if (id >= CC_GAIN_COUNT || !isfinite(v) || v < 0.0f) return 0;
-    if (id == CC_GAIN_USE_MAG) return v == 0.0f || v == 1.0f;
-    if (id == CC_GAIN_R_CAM || id == CC_GAIN_R_MAG)
-        return (double)v * v >= FLT_MIN && (double)v * v <= FLT_MAX;
-    return 1;
+    return cc_gain_value_valid(id, v);
 }
 
 void cc3_config_default(cc3_config_t *g) {
