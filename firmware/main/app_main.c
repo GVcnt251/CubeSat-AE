@@ -18,6 +18,7 @@
 #include "comms.h"
 #include "imu.h"
 #include "wheel.h"
+#include "esp_err.h"
 
 static const char *TAG = "cube";
 
@@ -30,7 +31,13 @@ static void control_task(void *arg)
 {
     TickType_t last = xTaskGetTickCount();
     const TickType_t period = pdMS_TO_TICKS(1000 / CONTROL_HZ);
-    uint32_t n = 0, stale = 0, late = 0;
+    uint32_t n = 0, late = 0, over_budget = 0;
+    uint64_t max_cycle_us = 0;
+    const uint64_t budget_us = 1000000ULL / CONTROL_HZ;
+
+    #ifndef CONFIG_CUBE_WHEEL_FAKE
+        uint32_t stale = 0;
+    #endif
     float vbat = 0;
     cc_out_t out = { 0 };
     imu_sample_t s = { 0 };
@@ -40,7 +47,12 @@ static void control_task(void *arg)
         if (xTaskDelayUntil(&last, period) == pdFALSE) late++;      /* perdeu o prazo */
         uint64_t t = (uint64_t)esp_timer_get_time();
 
-        if (s_imu_ok) imu_read(&s);                                 /* em falha mantém a última amostra */
+        bool imu_sample_ok = false;
+
+        if (s_imu_ok) {
+            imu_sample_ok = imu_read(&s) == ESP_OK;
+        }
+
         float mag[3];
         bool have_mag = (n % MAG_DIV == 0) && mag_read(mag) == ESP_OK;
         if (n % 40 == 0) vbat = battery_read_v();
@@ -50,14 +62,23 @@ static void control_task(void *arg)
         memcpy(m.accel, s.accel, sizeof(m.accel));
 
         CORE_LOCK();
-        if (have_mag) cc_on_mag(&g_core, t, mag);
-        cc_step(&g_core, t, &m, &out);
+
+        cc_imu_status_t imu_status = cc_step_with_imu(
+            &g_core, t, &m, imu_sample_ok, &out);
+
         cc_mode_t mode = g_core.mode;
+
+        if (have_mag && imu_sample_ok &&
+            (imu_status == CC_IMU_OK || mode == CC_MODE_CALIB)) {
+            cc_on_mag(&g_core, t, mag);
+        }
+
         CORE_UNLOCK();
 
-        /* segurança (ANTES de enviar): sem IMU só se permite a roda directa */
-        if (!s_imu_ok && mode != CC_MODE_WHEEL) out.enable = 0;
-
+        /* Sem IMU utilizável, bloquear modos dependentes da orientação. */
+        if (imu_status != CC_IMU_OK && mode != CC_MODE_WHEEL) {
+            out.enable = 0;
+        }
         w = wheel_update(&out);                                     /* envia já o comando; o estado serve o ciclo seguinte */
 #ifndef CONFIG_CUBE_WHEEL_FAKE
         if (!w.valid) {
@@ -68,26 +89,83 @@ static void control_task(void *arg)
             }
         } else stale = 0;
 #endif
-        if (++n % (CONTROL_HZ * 10) == 0 && late) { ESP_LOGW(TAG, "%u ciclos de controlo atrasados", (unsigned)late); late = 0; }
+        uint64_t cycle_us = (uint64_t)esp_timer_get_time() - t;
+
+        if (cycle_us > max_cycle_us) {
+            max_cycle_us = cycle_us;
+        }
+
+        if (cycle_us > budget_us) {
+            over_budget++;
+        }
+
+        if (++n % (CONTROL_HZ * 10) == 0) {
+            ESP_LOGI(TAG,
+                     "Controlo: max=%llu us, acima do periodo=%u, atrasos=%u",
+                     (unsigned long long)max_cycle_us,
+                     (unsigned)over_budget,
+                     (unsigned)late);
+
+            max_cycle_us = 0;
+            over_budget = 0;
+            late = 0;
+        }
     }
 }
 
 void app_main(void)
 {
     esp_err_t e = nvs_flash_init();
-    if (e == ESP_ERR_NVS_NO_FREE_PAGES || e == ESP_ERR_NVS_NEW_VERSION_FOUND) { nvs_flash_erase(); nvs_flash_init(); }
+
+    if (e == ESP_ERR_NVS_NO_FREE_PAGES ||
+        e == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        e = nvs_flash_init();
+    }
+
+ESP_ERROR_CHECK(e);
 
     g_core_mtx = xSemaphoreCreateMutex();
-    cc_init(&g_core, NULL);                                         /* configuração por omissão do núcleo */
 
-    battery_init();
+    if (g_core_mtx == NULL) {
+        ESP_LOGE(TAG, "Falha ao criar mutex do núcleo");
+        return;
+    }
+
+cc_init(&g_core, NULL);
+    if (battery_init() != 0) {
+    ESP_LOGE(TAG, "Falha na inicialização da leitura da bateria");
+    }
     s_imu_ok = imu_init() == ESP_OK;
-    if (!s_imu_ok) ESP_LOGE(TAG, "IMU em falta: só o modo WHEEL (nível 1) fica disponível");
+    if (!s_imu_ok) {
+        ESP_LOGE(TAG,
+                "Falha na inicialização da IMU: corrigir a causa e reiniciar o ESP32. "
+                "WHEEL requer calibração inicial concluída.");
+    }
     if (wheel_init() != 0) ESP_LOGE(TAG, "roda indisponível (driver CAN)");
     comms_init();
 
-    xTaskCreatePinnedToCore(control_task, "control", 4096, NULL, 20, NULL, 1);
-    xTaskCreatePinnedToCore(comms_task, "comms", 6144, NULL, 5, NULL, 0);
-    xTaskCreatePinnedToCore(camera_task, "camera", 8192, NULL, 6, NULL, 0);
+        BaseType_t task_result;
+
+        task_result = xTaskCreatePinnedToCore(
+            control_task, "control", 4096, NULL, 20, NULL, 1);
+        if (task_result != pdPASS) {
+            ESP_LOGE(TAG, "Falha ao criar tarefa de controlo");
+            ESP_ERROR_CHECK(ESP_FAIL);
+        }
+
+        task_result = xTaskCreatePinnedToCore(
+            comms_task, "comms", 6144, NULL, 5, NULL, 0);
+        if (task_result != pdPASS) {
+            ESP_LOGE(TAG, "Falha ao criar tarefa de comunicações");
+            ESP_ERROR_CHECK(ESP_FAIL);
+        }
+
+        task_result = xTaskCreatePinnedToCore(
+            camera_task, "camera", 8192, NULL, 6, NULL, 0);
+        if (task_result != pdPASS) {
+            ESP_LOGE(TAG, "Falha ao criar tarefa da câmara");
+            ESP_ERROR_CHECK(ESP_FAIL);
+        }
     ESP_LOGI(TAG, "cubo a arrancar: calibração do giroscópio nos primeiros %.1f s (cubo PARADO)", g_core.cfg.calib_s);
 }

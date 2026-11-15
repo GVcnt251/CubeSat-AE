@@ -36,6 +36,7 @@ static void map3(const int8_t R[3][3], const float in[3], float out[3])
 
 esp_err_t imu_init(void)
 {
+     s_mag_ok = false;
     i2c_master_bus_config_t bc = {
         .i2c_port = I2C_NUM_0, .sda_io_num = PIN_I2C_SDA, .scl_io_num = PIN_I2C_SCL,
         .clk_source = I2C_CLK_SRC_DEFAULT, .glitch_ignore_cnt = 7, .flags.enable_internal_pullup = true,
@@ -54,23 +55,41 @@ esp_err_t imu_init(void)
         ESP_LOGE(TAG, "MPU-6050 não responde (WHO_AM_I=0x%02x, err=%s)", id, esp_err_to_name(e));
         return ESP_FAIL;
     }
-    ESP_ERROR_CHECK(wr(s_mpu, 0x6B, 0x01));                  /* PWR_MGMT_1: acordar, relógio = PLL gyro X */
-    ESP_ERROR_CHECK(wr(s_mpu, 0x19, 4));                     /* SMPLRT_DIV: 1 kHz/(1+4) = 200 Hz */
-    ESP_ERROR_CHECK(wr(s_mpu, 0x1A, 0x03));                  /* CONFIG: DLPF ~42 Hz */
-    ESP_ERROR_CHECK(wr(s_mpu, 0x1B, 0x08));                  /* GYRO_CONFIG: +-500 dps */
-    ESP_ERROR_CHECK(wr(s_mpu, 0x1C, 0x08));                  /* ACCEL_CONFIG: +-4 g */
+    e = wr(s_mpu, 0x6B, 0x01);                  /* relógio */
+    if (e == ESP_OK) e = wr(s_mpu, 0x19, 4);    /* 200 Hz */
+    if (e == ESP_OK) e = wr(s_mpu, 0x1A, 0x03); /* filtro */
+    if (e == ESP_OK) e = wr(s_mpu, 0x1B, 0x08); /* giroscópio */
+    if (e == ESP_OK) e = wr(s_mpu, 0x1C, 0x08); /* acelerómetro */
 
-    e = rd(s_mag, 0x0F, &id, 1);                             /* WHO_AM_I = 0x3D */
-    if (e == ESP_OK && id == 0x3D) {
-        wr(s_mag, 0x20, 0x7C);                               /* CTRL_REG1: UHP em XY, 80 Hz */
-        wr(s_mag, 0x21, 0x00);                               /* CTRL_REG2: +-4 gauss */
-        wr(s_mag, 0x22, 0x00);                               /* CTRL_REG3: conversão contínua */
-        wr(s_mag, 0x23, 0x0C);                               /* CTRL_REG4: UHP em Z */
-        wr(s_mag, 0x24, 0x40);                               /* CTRL_REG5: BDU */
-        s_mag_ok = true;
-    } else {
-        ESP_LOGW(TAG, "LIS3MDL não responde (id=0x%02x): sem magnetómetro, o rumo só usa o giroscópio", id);
+    if (e != ESP_OK) {
+        ESP_LOGE(TAG, "Falha ao configurar MPU-6050: %s",
+                 esp_err_to_name(e));
+        return e;
     }
+
+        id = 0;
+        e = rd(s_mag, 0x0F, &id, 1);  /* WHO_AM_I = 0x3D */
+
+        if (e == ESP_OK && id == 0x3D) {
+            e = wr(s_mag, 0x20, 0x7C);  /* CTRL_REG1 */
+            if (e == ESP_OK) e = wr(s_mag, 0x21, 0x00);  /* CTRL_REG2 */
+            if (e == ESP_OK) e = wr(s_mag, 0x22, 0x00);  /* CTRL_REG3 */
+            if (e == ESP_OK) e = wr(s_mag, 0x23, 0x0C);  /* CTRL_REG4 */
+            if (e == ESP_OK) e = wr(s_mag, 0x24, 0x40);  /* CTRL_REG5 */
+
+            if (e == ESP_OK) {
+                s_mag_ok = true;
+                ESP_LOGI(TAG, "LIS3MDL configurado");
+            } else {
+                ESP_LOGW(TAG,
+                        "Falha ao configurar LIS3MDL: %s; magnetómetro indisponível",
+                        esp_err_to_name(e));
+            }
+        } else {
+            ESP_LOGW(TAG,
+                    "LIS3MDL indisponível (id=0x%02x, err=%s)",
+                    id, esp_err_to_name(e));
+        }
     return ESP_OK;
 }
 

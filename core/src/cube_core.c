@@ -2,14 +2,20 @@
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
+#include <float.h>
 
 #define PI_F 3.14159265358979f
 #define US(x) ((double)(x) * 1e-6)
 
+/* Keep intermediate controller arithmetic representable without imposing physical limits. */
+static float bounded_float(double v)
+{
+    return (float)(v > FLT_MAX ? FLT_MAX : (v < -FLT_MAX ? -FLT_MAX : v));
+}
+
 static float wrapf(float a)
 {
-    while (a >  PI_F) a -= 2.0f * PI_F;
-    while (a < -PI_F) a += 2.0f * PI_F;
+    a = remainderf(a, 2.0f * PI_F);
     return a;
 }
 static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
@@ -23,6 +29,7 @@ void cc_config_default(cc_config_t *g)
     g->cam_fx = 249.0f; g->cam_fy = 249.0f; g->cam_cx = 159.5f; g->cam_cy = 119.5f;
     cc_det_cfg_default(&g->det);
     g->calib_s = 1.5f;
+    g->imu_timeout_us = 50000;
 
     g->q_psi    = 1e-7f;
     g->q_bias   = 1e-9f;
@@ -43,6 +50,7 @@ void cc_config_default(cc_config_t *g)
     g->wheel_accel = 800.0f;
 
     g->t_lock = 0.30f; g->t_search = 5.0f; g->search_rate = 0.35f;
+    g->search_span_known = 0.349066f; g->search_span_unknown = 2.792527f;
 }
 
 void cc_init(cc_t *c, const cc_config_t *cfg)
@@ -132,20 +140,36 @@ static void finish_calibration(cc_t *c)
     memset(c->P, 0, sizeof(c->P));
     c->P[0][0] = 0.02f * 0.02f; c->P[1][1] = 1e-6f; c->P[2][2] = 1.0f;
     c->psi_zero = psi;
+    c->imu_calibrated_once = 1;
+    if (c->imu_recal_requested) c->imu_recal_required = 0;
+    c->imu_recal_requested = 0;
     c->calibrated = 1; c->target_valid = 0; c->h_count = 0; c->h_head = 0;
+    /* Keep camera age truthful; only forget the search prior. */
+    c->search_target_known = 0;
     c->rate_I = 0; c->w_ref_prev = 0;
+    c->unloading = c->unload_returning = 0; c->unload_offset = 0;
     c->mode = CC_MODE_IDLE; c->trk = CC_TRK_NONE;
 }
 
 /* ------------------------------------------------------------------ comandos */
 
+int cc_gain_valid(uint32_t id, float v)
+{
+    if (id >= CC_GAIN_COUNT || !isfinite(v) || v < 0.0f) return 0;
+    if (id == CC_GAIN_USE_MAG) return v == 0.0f || v == 1.0f;
+    if (id == CC_GAIN_R_CAM || id == CC_GAIN_R_MAG)
+        return (double)v * v >= FLT_MIN && (double)v * v <= FLT_MAX;
+    return 1;
+}
+
 void cc_command(cc_t *c, const cc_cmd_t *cmd)
 {
+    if (!c || !cmd || (cmd->type != CC_CMD_RECAL && !isfinite(cmd->a))) return;
     cc_config_t *g = &c->cfg;
     switch (cmd->type) {
     case CC_CMD_MODE:
         if (c->mode == CC_MODE_CALIB) break;
-        if ((int)cmd->a >= CC_MODE_IDLE && (int)cmd->a <= CC_MODE_TRACK) {
+        if (cmd->a >= CC_MODE_IDLE && cmd->a <= CC_MODE_TRACK && floorf(cmd->a) == cmd->a) {
             if ((cc_mode_t)(int)cmd->a == CC_MODE_TRACK && c->mode != CC_MODE_TRACK) c->entering_track = 1;
             c->mode = (cc_mode_t)(int)cmd->a;
         }
@@ -155,10 +179,24 @@ void cc_command(cc_t *c, const cc_cmd_t *cmd)
     case CC_CMD_HEADING: c->heading_sp = cmd->a; break;
     case CC_CMD_AIM:     c->aim = cmd->a; break;
     case CC_CMD_RECAL:
-        c->mode = CC_MODE_CALIB; c->calibrated = 0; c->started = 0;
-        c->gsum = 0; c->gcount = 0; c->gsq = 0; c->msin = c->mcos = 0; c->mcount = 0;
+        {
+            cc_config_t saved = c->cfg;
+            int blocked = c->imu_recal_required, once = c->imu_calibrated_once;
+            int seen = c->imu_seen, call_seen = c->imu_call_seen, missing = c->imu_missing;
+            uint64_t valid_us = c->imu_last_valid_us, call_us = c->imu_last_call_us;
+            int cam_seen = c->cam_seen;
+            uint64_t cam_us = c->last_cam_us, capture_us = c->last_cam_capture_us;
+            cc_init(c, &saved);
+            c->imu_seen = seen; c->imu_call_seen = call_seen; c->imu_missing = missing;
+            c->imu_last_valid_us = valid_us; c->imu_last_call_us = call_us;
+            c->cam_seen = cam_seen; c->last_cam_us = cam_us; c->last_cam_capture_us = capture_us;
+            c->imu_recal_required = blocked;
+            c->imu_calibrated_once = once;
+            c->imu_recal_requested = 1;
+        }
         break;
     case CC_CMD_GAIN:
+        if (!cc_gain_valid(cmd->id, cmd->a)) break;
         switch ((cc_gain_t)cmd->id) {
         case CC_GAIN_K_THETA:    g->k_theta = cmd->a; break;
         case CC_GAIN_RATE_KP:    g->rate_kp = cmd->a; break;
@@ -183,6 +221,8 @@ void cc_command(cc_t *c, const cc_cmd_t *cmd)
 void cc_on_mag(cc_t *c, uint64_t t_us, const float m[3])
 {
     (void)t_us;
+    if (c->imu_missing || (c->imu_recal_required && c->mode != CC_MODE_CALIB)) return;
+    if (!isfinite(m[0]) || !isfinite(m[1]) || !isfinite(m[2])) { c->mag_ok = 0; return; }
     float mag = sqrtf(m[0] * m[0] + m[1] * m[1] + m[2] * m[2]);
     if (fabsf(mag - c->cfg.mag_nom_uT) > c->cfg.mag_tol * c->cfg.mag_nom_uT) { c->mag_ok = 0; return; }
     if (!c->tilt_valid) return;
@@ -214,12 +254,19 @@ int cc_on_detection(cc_t *c, uint64_t t_capture_us, uint64_t now_us, const cc_de
     memset(out, 0, sizeof(*out));
     out->t_capture_ms = (uint32_t)(t_capture_us / 1000);
     out->found = d.found; out->n_cand = d.n_cand;
-    if (!d.found) return 0;
+    if (!d.found || !isfinite(d.x) || !isfinite(d.y) || !isfinite(d.contrast) ||
+        d.x < 0 || d.x >= CC_IMG_W || d.y < 0 || d.y >= CC_IMG_H || d.area <= 0 ||
+        d.area > CC_IMG_N) return 0;
     out->x = d.x; out->y = d.y; out->area = (uint32_t)d.area; out->contrast = d.contrast;
     out->err_x = atan2f(d.x - c->cfg.cam_cx, c->cfg.cam_fx);
     out->err_y = atan2f(d.y - c->cfg.cam_cy, c->cfg.cam_fy);
 
-    if (!c->calibrated || c->mode == CC_MODE_CALIB) return 0;
+    /* Raw vision is still reported when fusion is unavailable (ICD found != accepted). */
+    if (!c->calibrated || c->mode == CC_MODE_CALIB || c->imu_missing ||
+        c->imu_recal_required || !c->h_count || t_capture_us > now_us ||
+        (c->cam_seen && (now_us < c->last_cam_us || t_capture_us <= c->last_cam_capture_us))) return 0;
+    int oldest = (c->h_head - c->h_count + CC_HIST) % CC_HIST;
+    if (t_capture_us < c->t_hist[oldest]) return 0;
 
     float z = out->err_x;
     double since = c->target_valid ? US(now_us - c->last_cam_us) : 1e9;
@@ -231,13 +278,13 @@ int cc_on_detection(cc_t *c, uint64_t t_capture_us, uint64_t now_us, const cc_de
         c->P[0][2] = c->P[2][0] = c->P[0][0];
         c->P[1][2] = c->P[2][1] = c->P[0][1];
         for (int k = 0; k < c->h_count; k++) c->e_hist[k] = c->x[2] - c->psi_hist[k];
-        c->target_valid = 1; c->rejects = 0; c->last_cam_us = now_us;
+        c->target_valid = 1; c->rejects = 0; c->last_cam_us = now_us; c->cam_seen = 1; c->last_cam_capture_us = t_capture_us; c->search_target_known = 1;
         out->accepted = 1;
         return 1;
     }
 
     float psi_c, e_c; hist_get(c, t_capture_us, &psi_c, &e_c);
-    float y = z - e_c;
+    float y = wrapf(z - e_c);
     if (fabsf(y) > c->cfg.cam_gate) {
         if (++c->rejects >= 5) {             /* 5 rejeições seguidas: o modelo perdeu-se */
             c->target_valid = 0;
@@ -248,7 +295,7 @@ int cc_on_detection(cc_t *c, uint64_t t_capture_us, uint64_t now_us, const cc_de
     float h[3] = { -1.0f, 0.0f, 1.0f }, k[3];
     kf_update(c, h, y, c->cfg.r_cam, k);
     hist_shift(c, k[0] * y, (k[2] - k[0]) * y);
-    c->last_cam_us = now_us;
+    c->last_cam_us = now_us; c->cam_seen = 1; c->last_cam_capture_us = t_capture_us; c->search_target_known = 1;
     out->accepted = 1;
     return 1;
 }
@@ -262,9 +309,44 @@ int cc_on_image(cc_t *c, uint64_t t_capture_us, uint64_t now_us, const uint8_t *
 
 /* ------------------------------------------------------------------- passo */
 
-void cc_step(cc_t *c, uint64_t now_us, const cc_meas_t *m, cc_out_t *out)
+static void update_tlm(cc_t *c, uint64_t now_us, const cc_meas_t *m,
+                       const cc_out_t *out, float err, float rate_ref)
 {
     const cc_config_t *g = &c->cfg;
+    cc_tlm_t *t = &c->tlm;
+    t->t_ms = (uint32_t)(now_us / 1000);
+    t->mode = (uint8_t)c->mode; t->trk = (uint8_t)c->trk;
+    if (m) {
+        if (isfinite(m->wheel_rps)) t->wheel_rps = m->wheel_rps;
+        if (isfinite(m->wheel_torque)) t->torque_nm = m->wheel_torque;
+        if (isfinite(m->vbat_v)) t->vbat_v = m->vbat_v;
+    }
+    t->flags = (uint16_t)((c->target_valid ? CC_FLAG_TARGET_VALID : 0)
+        | (fabsf(t->wheel_rps) > 0.95f * g->wheel_lim ? CC_FLAG_WHEEL_SAT : 0)
+        | (c->mag_ok ? CC_FLAG_MAG_OK : 0)
+        | (c->calibrated ? CC_FLAG_CALIBRATED : 0)
+             | (c->unloading ? CC_FLAG_UNLOADING : 0)
+        | (fabsf(c->roll) > PI_F/18.0f || fabsf(c->pitch) > PI_F/18.0f ? CC_FLAG_TILT_HIGH : 0));
+    t->heading = c->x[0] - c->psi_zero;
+    t->rate = c->gyro_z - c->x[1]; t->bias = c->x[1];
+    t->err = err; t->rate_ref = rate_ref;
+    t->wheel_cmd_rps = out->wheel_cmd_rps;
+    t->target_err = c->x[2] - c->x[0];
+    t->cam_age_s = !c->cam_seen ? -1.0f :
+        (now_us >= c->last_cam_us ? (float)US(now_us - c->last_cam_us) : 0.0f);
+}
+
+static void step_valid(cc_t *c, uint64_t now_us, const cc_meas_t *m, cc_out_t *out)
+{
+    const cc_config_t *g = &c->cfg;
+    /* Invalid IMU samples and non-monotonic timestamps must not update the filter. */
+    if (!isfinite(m->gyro[2]) ||
+        !isfinite(m->accel[0]) || !isfinite(m->accel[1]) || !isfinite(m->accel[2]) ||
+        (c->started && now_us <= c->last_us)) {
+        memset(out, 0, sizeof(*out));
+        c->tlm.wheel_cmd_rps = 0.0f;
+        return;
+    }
     float dt = 0.005f;
     if (!c->started) {
         c->started = 1; c->calib_start_us = now_us; c->last_us = now_us;
@@ -274,7 +356,7 @@ void cc_step(cc_t *c, uint64_t now_us, const cc_meas_t *m, cc_out_t *out)
     }
     float gz = m->gyro[2];
     c->gyro_z = gz;
-    c->wheel_meas = m->wheel_rps;
+    if (isfinite(m->wheel_rps)) c->wheel_meas = m->wheel_rps;
 
     /* inclinação (só serve para compensar o magnetómetro) */
     float roll_m  = atan2f(m->accel[1], m->accel[2]);
@@ -304,9 +386,10 @@ void cc_step(cc_t *c, uint64_t now_us, const cc_meas_t *m, cc_out_t *out)
         hist_push(c, now_us);
         w_hat = gz - c->x[1];
 
-        if (c->entering_track) { c->entering_track = 0; c->track_entry_us = now_us; }
+        if (c->entering_track) { c->entering_track = 0; c->track_entry_us = now_us; c->trk = CC_TRK_NONE; }
 
         int closed_loop = 0;
+        if (c->mode != CC_MODE_TRACK) c->trk = CC_TRK_NONE;
         switch (c->mode) {
         case CC_MODE_WHEEL: {
             out->enable = 1;
@@ -319,10 +402,11 @@ void cc_step(cc_t *c, uint64_t now_us, const cc_meas_t *m, cc_out_t *out)
         case CC_MODE_HEADING:
             closed_loop = 1;
             err = wrapf(c->heading_sp - (c->x[0] - c->psi_zero));
-            w_ref = g->k_theta * err;
+            w_ref = bounded_float((double)g->k_theta * err);
             break;
         case CC_MODE_TRACK: {
             closed_loop = 1;
+            cc_trk_t previous_trk = c->trk;
             double since = c->target_valid ? US(now_us - c->last_cam_us) : US(now_us - c->track_entry_us);
             if (c->target_valid && since < g->t_lock) c->trk = CC_TRK_LOCKED;
             else if (c->target_valid && since < g->t_search) c->trk = CC_TRK_COAST;
@@ -330,15 +414,59 @@ void cc_step(cc_t *c, uint64_t now_us, const cc_meas_t *m, cc_out_t *out)
             else c->trk = CC_TRK_SEARCH;
 
             if (c->trk == CC_TRK_LOCKED || c->trk == CC_TRK_COAST) {
-                err = (c->x[2] - c->x[0]) - c->aim;
-                w_ref = g->k_theta * err;
+                err = wrapf((c->x[2] - c->x[0]) - c->aim);
+                w_ref = bounded_float((double)g->k_theta * err);
                 c->search_dir = err >= 0 ? 1.0f : -1.0f;
             } else if (c->trk == CC_TRK_SEARCH) {
+                if (previous_trk != CC_TRK_SEARCH) {
+                    c->search_center = c->search_target_known ? c->x[0] + wrapf(c->x[2] - c->x[0]) : c->x[0];
+                    c->search_span = c->search_target_known ? g->search_span_known : g->search_span_unknown;
+                }
+                c->search_rot = c->x[0] - c->search_center;
+                if (c->search_rot >= c->search_span) c->search_dir = -1.0f;
+                else if (c->search_rot <= -c->search_span) c->search_dir = 1.0f;
                 w_ref = c->search_dir * g->search_rate;
             }
             break;
         }
         default: break;  /* IDLE */
+        }
+
+        /* Pequenos ciclos de atitude transferem momento para o atrito externo do gimbal.
+         * Nenhum estado da roda é reposto: a descarga resulta da dinâmica corpo+roda+apoio.
+         * O erro transmitido continua a ser o erro real de apontamento, sem este desvio. */
+        int position_control = c->mode == CC_MODE_HEADING || (c->mode == CC_MODE_TRACK &&
+                               (c->trk == CC_TRK_LOCKED || c->trk == CC_TRK_COAST));
+        if (g->gimbal_unload && position_control) {
+            float wheel = fabsf(m->wheel_rps);
+            if (!c->unloading && wheel > 0.65f * g->wheel_lim) {
+                c->unloading = 1; c->unload_returning = 0; c->unload_offset = 0;
+                c->unload_dir = m->wheel_rps >= 0 ? 1.0f : -1.0f;
+            }
+            if (c->unloading) {
+                if (wheel < 0.45f * g->wheel_lim) c->unload_returning = 1;
+                if (fabsf(err) > 0.05236f || fabsf(w_hat) > 0.35f) {
+                    c->unload_offset = 0; c->unload_returning = 0;
+                } else {
+                    float before = c->unload_offset;
+                    if (!c->unload_returning) {
+                        c->unload_offset += c->unload_dir * 0.01f * dt;
+                        if (fabsf(c->unload_offset) >= 0.021817f) { /* 1,25° */
+                            c->unload_offset = c->unload_dir * 0.021817f; c->unload_returning = 1;
+                        }
+                    } else {
+                        float delta = 0.15f * dt;
+                        if (fabsf(c->unload_offset) <= delta) {
+                            c->unload_offset = 0; c->unload_returning = 0;
+                            if (wheel < 0.45f * g->wheel_lim) c->unloading = 0;
+                            c->unload_dir = m->wheel_rps >= 0 ? 1.0f : -1.0f;
+                        } else c->unload_offset -= c->unload_dir * delta;
+                    }
+                    w_ref += g->k_theta * c->unload_offset + (c->unload_offset - before) / dt;
+                }
+            }
+        } else {
+            c->unloading = c->unload_returning = 0; c->unload_offset = 0;
         }
 
         if (closed_loop) {
@@ -349,40 +477,123 @@ void cc_step(cc_t *c, uint64_t now_us, const cc_meas_t *m, cc_out_t *out)
             float e_w = c->w_ref_prev - w_hat;
 
             /* PI com integração condicional (anti-windup): a roda diminui quando o corpo acelera */
-            float I_new = c->rate_I + e_w * dt;
-            float cmd_old = -(g->rate_kp * (e_w) + g->rate_ki * c->rate_I);
-            float cmd_new = -(g->rate_kp * (e_w) + g->rate_ki * I_new);
-            if (fabsf(cmd_new) <= g->wheel_lim || fabsf(cmd_new) < fabsf(cmd_old)) c->rate_I = I_new;
-            out->wheel_cmd_rps = clampf(-(g->rate_kp * e_w + g->rate_ki * c->rate_I), -g->wheel_lim, g->wheel_lim);
+            if (g->rate_ki == 0.0f) c->rate_I = 0.0f;
+            float I_new = g->rate_ki > 0.0f ? bounded_float((double)c->rate_I + (double)e_w * dt) : 0.0f;
+            double cmd_old = -((double)g->rate_kp * e_w + (double)g->rate_ki * c->rate_I);
+            double cmd_new = -((double)g->rate_kp * e_w + (double)g->rate_ki * I_new);
+            /* Não acumular I ao tentar contrariar uma rotação externa muito acima da referência admissível.
+             * P continua a reagir; a integração retoma quando o movimento volta à gama controlável. */
+            float disturbance_limit = fmaxf(1.5f * g->w_ref_max, g->w_ref_max + 0.35f);
+            int opposing_fast = w_hat * c->w_ref_prev <= 0.0f && fabsf(w_hat) > fmaxf(0.1f * g->w_ref_max, 0.10f);
+            int imposed_motion = (c->mode == CC_MODE_TRACK || c->mode == CC_MODE_HEADING)
+                                 && (fabsf(w_hat) > disturbance_limit || opposing_fast);
+            if (!imposed_motion && (fabs(cmd_new) <= g->wheel_lim || fabs(cmd_new) < fabs(cmd_old))) c->rate_I = I_new;
+            out->wheel_cmd_rps = clampf(bounded_float(-((double)g->rate_kp * e_w + (double)g->rate_ki * c->rate_I)), -g->wheel_lim, g->wheel_lim);
         } else {
             /* seguimento sem salto (bumpless) para quando se fechar a malha */
             float w = (c->mode == CC_MODE_WHEEL) ? out->wheel_cmd_rps : m->wheel_rps;
-            c->rate_I = -w / g->rate_ki;
+            c->rate_I = g->rate_ki > 0.0f && isfinite(w) ? bounded_float(-(double)w / g->rate_ki) : 0.0f;
             c->w_ref_prev = w_hat;
             if (c->mode != CC_MODE_TRACK) c->trk = CC_TRK_NONE;
         }
-        c->w_ref_last = w_ref;
+        c->w_ref_last = closed_loop ? c->w_ref_prev : 0.0f;
     }
 
-    /* telemetria */
-    cc_tlm_t *t = &c->tlm;
-    t->t_ms = (uint32_t)(now_us / 1000);
-    t->mode = (uint8_t)c->mode; t->trk = (uint8_t)c->trk;
-    t->flags = (uint16_t)((c->target_valid ? CC_FLAG_TARGET_VALID : 0)
-             | ((fabsf(m->wheel_rps) > 0.95f * g->wheel_lim) ? CC_FLAG_WHEEL_SAT : 0)
-             | (c->mag_ok ? CC_FLAG_MAG_OK : 0)
-             | (c->calibrated ? CC_FLAG_CALIBRATED : 0)
-             | ((fabsf(c->roll) > 0.17f || fabsf(c->pitch) > 0.17f) ? CC_FLAG_TILT_HIGH : 0));
-    t->heading = c->x[0] - c->psi_zero;
-    t->rate = w_hat; t->bias = c->x[1];
-    t->err = err; t->rate_ref = c->w_ref_last;
-    t->wheel_rps = m->wheel_rps; t->wheel_cmd_rps = out->wheel_cmd_rps;
-    t->torque_nm = m->wheel_torque; t->vbat_v = m->vbat_v;
-    t->target_err = c->x[2] - c->x[0];
-    t->cam_age_s = c->target_valid ? (float)US(now_us - c->last_cam_us) : -1.0f;
+    update_tlm(c, now_us, m, out, err, c->w_ref_last);
+}
+
+/* Reset all calibration accumulators on any break in the valid window. */
+static void restart_calibration_window(cc_t *c)
+{
+    c->started = 0;
+    c->gsum = c->gsq = 0; c->gcount = 0;
+    c->msin = c->mcos = 0; c->mcount = 0;
+    c->tilt_valid = 0; c->mag_ok = 0;
+}
+
+static void imu_hold_output(cc_t *c, uint64_t now_us, const cc_meas_t *m, cc_out_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->torque_max_nm = c->cfg.torque_max;
+    out->accel_limit_rps2 = c->cfg.wheel_accel;
+    if (c->mode == CC_MODE_WHEEL && c->imu_calibrated_once) {
+        out->enable = 1;
+        out->wheel_cmd_rps = clampf(c->wheel_sp, -c->cfg.wheel_lim, c->cfg.wheel_lim);
+    }
+    /* Cancel the unload manoeuvre on IMU hold. Restart from zero only
+     * on a normal valid control cycle if its entry conditions still hold. */
+    c->unloading = c->unload_returning = 0;
+    c->unload_offset = c->unload_dir = 0.0f;
+    c->trk = CC_TRK_NONE;
+    update_tlm(c, now_us, m, out, 0.0f, 0.0f);
+}
+
+cc_imu_status_t cc_step_with_imu(cc_t *c, uint64_t now_us,
+                               const cc_meas_t *m, int imu_valid, cc_out_t *out)
+{
+    int monotonic = !c->imu_call_seen || now_us > c->imu_last_call_us;
+    int valid = imu_valid && m && monotonic &&
+        isfinite(m->gyro[2]) && isfinite(m->accel[0]) &&
+        isfinite(m->accel[1]) && isfinite(m->accel[2]);
+    int long_gap = c->imu_seen && now_us >= c->imu_last_valid_us &&
+        now_us - c->imu_last_valid_us > c->cfg.imu_timeout_us;
+    int recovering = c->imu_missing || long_gap;
+    if (monotonic) { c->imu_last_call_us = now_us; c->imu_call_seen = 1; }
+    if (long_gap) c->imu_recal_required = 1;
+    if (!valid) {
+        c->imu_missing = 1;
+        if (c->mode == CC_MODE_CALIB) restart_calibration_window(c);
+        imu_hold_output(c, now_us, m, out);
+        return c->imu_recal_required ? CC_IMU_RECAL_REQUIRED : CC_IMU_UNAVAILABLE;
+    }
+    c->imu_seen = 1; c->imu_last_valid_us = now_us; c->imu_missing = 0;
+    if (recovering) {
+        if (c->mode == CC_MODE_CALIB) restart_calibration_window(c);
+        else {
+            /* No interpolation across an unobserved interval. */
+            c->last_us = now_us;
+            c->h_count = c->h_head = 0;
+            hist_push(c, now_us); /* New epoch: older camera frames cannot cross the IMU gap. */
+            c->target_valid = 0; c->trk = CC_TRK_NONE;
+            c->rate_I = 0; c->w_ref_prev = 0; c->w_ref_last = 0;
+            c->entering_track = c->mode == CC_MODE_TRACK;
+        }
+    }
+    if ((c->imu_recal_required && c->mode != CC_MODE_CALIB) ||
+        (recovering && c->mode != CC_MODE_CALIB)) {
+        c->last_us = now_us;
+        imu_hold_output(c, now_us, m, out);
+    } else {
+        step_valid(c, now_us, m, out);
+    }
+    return c->imu_recal_required ? CC_IMU_RECAL_REQUIRED : CC_IMU_OK;
+}
+
+void cc_step(cc_t *c, uint64_t now_us, const cc_meas_t *m, cc_out_t *out)
+{
+    (void)cc_step_with_imu(c, now_us, m, 1, out);
 }
 
 void cc_get_tlm(const cc_t *c, cc_tlm_t *out) { *out = c->tlm; }
+
+int cc_set_camera_model(cc_t *c, float fx, float fy)
+{
+    if (!isfinite(fx) || !isfinite(fy) || fx <= 0 || fy <= 0) return 0;
+    c->cfg.cam_fx = fx; c->cfg.cam_fy = fy; return 1;
+}
+void cc_clear_target(cc_t *c) { c->target_valid = 0; c->rejects = 0; c->track_entry_us = c->last_us; }
+int cc_point_absolute(cc_t *c, float heading)
+{
+    if (!c->calibrated || !isfinite(heading)) return 0;
+    c->heading_sp = wrapf(heading - c->psi_zero);
+    c->aim = 0; c->mode = CC_MODE_HEADING; return 1;
+}
+int cc_set_search_limits(cc_t *c, float known_span, float unknown_span)
+{
+    if (!isfinite(known_span) || !isfinite(unknown_span) || known_span <= 0 || unknown_span < known_span || unknown_span > PI_F) return 0;
+    c->cfg.search_span_known = known_span; c->cfg.search_span_unknown = unknown_span; return 1;
+}
+void cc_set_gimbal_unload(cc_t *c, int enabled) { c->cfg.gimbal_unload = enabled != 0; }
 
 /* ------------------------------------------------------------ ligação ctypes */
 cc_t *cc_create(void) { cc_t *c = (cc_t *)malloc(sizeof(cc_t)); if (c) cc_init(c, NULL); return c; }

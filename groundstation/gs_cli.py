@@ -17,8 +17,23 @@ a = ap.parse_args()
 
 link = UdpLink(a.host, a.port)
 link.send_frame(P.tc_ping)
-time.sleep(0.2)
 link.send_frame(P.tc_stream, 10, 10, 0)
+# O núcleo ignora mudanças de modo durante CALIB. Espera por telemetria válida.
+deadline = time.monotonic() + 10.0
+ready = False
+next_ping = 0.0
+while time.monotonic() < deadline and not ready:
+    if time.monotonic() >= next_ping:
+        link.send_frame(P.tc_ping)
+        link.send_frame(P.tc_stream, 10, 10, 0)
+        next_ping = time.monotonic() + 1.0
+    for kind, obj in link.poll():
+        if kind == "state" and obj.mode != 0:
+            ready = True
+    time.sleep(0.01)
+if not ready:
+    link.close()
+    ap.exit(1, "Sem telemetria calibrada em 10 s. Verifica o simulador, host e porta.\n")
 if a.mode:
     mode = {"idle": 1, "wheel": 2, "rate": 3, "heading": 4, "track": 5}[a.mode]
     if a.mode == "wheel": link.send_frame(P.tc_wheel, a.value)
@@ -34,3 +49,4 @@ while time.time() < t_end:
             print(f"t={s.t_ms/1000:6.2f}s {P.MODES[s.mode]:8s} {P.TRK[s.trk]:7s} rumo={s.heading:7.2f}° erro={s.err:7.2f}° "
                   f"alvo_est={s.target_err:7.2f}° roda={s.wheel_rpm:7.0f}rpm flags={s.flags:#04x}")
     time.sleep(0.01)
+link.close()

@@ -138,3 +138,52 @@ Gerada por `core/src/moteus_proto.c`, conforme a documentação oficial (`protoc
 * ID CAN: `(origem | 0x80 se pede resposta) << 8 | destino`. Cubo = 0, moteus = `CONFIG_CUBE_MOTEUS_ID`. A resposta vem com o ID `moteus << 8 | 0`.
 * Comando (48 bytes, preenchido com NOP `0x50`): `01 00 0a` (modo = posição) · `0c 06 20` + 6 *floats* nos registos 0x020..0x025 (posição = **NaN** ⇒ controlo de velocidade, velocidade em rev/s, *feed-forward* 0, kp/kd = 1, binário máximo) · `0d 29` + *float* (limite de aceleração, rev/s²) · pedido de estado `11 00 · 1f 01 · 13 0d`.
 * Conforme o guia *Control Modes* do moteus, em modo velocidade convém configurar `servo.max_position_slip` com um valor finito e ligar um *watchdog* no moteus (`servo.default_timeout_s`) para que a roda pare se o firmware bloquear.
+
+
+## 8. Extensão de simulação de três rodas (v5)
+
+Esta extensão só existe no servidor de PC; não altera TM_STATE/TM_VISION nem os comandos do firmware.
+
+- `SIM_SHOVE_XY` (0xF4): dois f32 little-endian, X horizontal em graus e Y vertical em graus. O servidor aceita X até +/-180° e Y até +/-45°; a interface limita a +/-90° e +/-30°. Empurrão de 0,25 s. X aplica yaw, Y aplica -pitch. ACK_BAD_LEN para comprimento diferente de 8; ACK_BAD_ARG para valores não finitos ou fora do intervalo.
+- `SIM_SHOVE` (0xF0) mantém o empurrão horizontal legado.
+- `TM_SIM3` (0x04): 89 bytes, formato Python `<IB21f`. u32 t_ms; u8 máscara de saturação (bit0 roda X/roll, bit1 roda Y/pitch, bit2 roda Z/yaw); sete grupos de três f32, sempre por ordem roll/pitch/yaw: orientação estimada relativa à calibração [graus], velocidade angular medida [graus/s], velocidades das rodas [rpm], comandos das rodas [rpm], binários medidos [N m], erros de controlo [graus], orientações estimadas dos alvos/referências [graus]. O pacote acompanha TM_STATE à frequência state_hz.
+- As referências roll/pitch são obtidas de medições simuladas da gravidade; yaw usa magnetómetro. Os ganhos/limites enviados são aplicados às três instâncias do núcleo. TRACK no canal roll é mapeado para HEADING=0 para estabilizar a referência de roll.
+- O modelo é desacoplado por eixo. O firmware existente não implementa esta extensão nem a integração das três rodas.
+
+
+## 9. Extensão do gimbal (v6, apenas simulador)
+
+- `SIM_GIMBAL_CFG` (0xF5): `<4f`, 16 bytes: massa [kg], CM x/y/z [m] no corpo desde o pivô. Exige IDLE nas três instâncias. Massa 0,1 a 10 kg; |CM_i| até 0,05 m. Valores não finitos/fora do intervalo ou modo errado dão ACK_BAD_ARG; comprimento errado dá ACK_BAD_LEN. Atualiza carga gravítica e inércia efetiva. Gravidade terrestre fixa em 9,80665 m/s².
+- `SIM_REST` (0xF6): sem payload. Captura a orientação física atual como referência. Exige IDLE e ausência de empurrão, com velocidades inferiores a 0,5°/s durante pelo menos 0,5 s. Não altera o alvo, sensores ou equilíbrio gravítico.
+- `TM_GIMBAL` (0x05): 110 bytes, `<IH26f`: u32 t_ms, u16 reference_id e 26 floats. Sete grupos de três floats: orientação física absoluta roll/pitch/yaw [graus]; orientação de repouso absoluta R/P/Y [graus]; Euler relativo ZYX [graus]; ângulos dos planos XY/XZ/YZ [0 a 90 graus]; binários gravíticos generalizados R/P/Y [N m]; vetor gravidade no corpo [m/s²]; referência física do alvo R/P/Y [graus]. Depois: massa [kg], g [m/s²], CM x/y/z [m]. Emitido à frequência state_hz. O vetor gravidade é aceleração gravítica, não o binário nem uma aceleração de queda do pivô.
+- A orientação de repouso inicial é a orientação física no arranque. `TC_RECAL` não a altera. `TM_STATE` e `TM_SIM3` continuam a representar estimativas/controlo; `TM_GIMBAL` é metadado físico do simulador e não alimenta os controladores.
+
+
+## 10. Webcam fixa com simulação óptica (v7, apenas simulador)
+
+- `SIM_CAMERA` 0xF7: `<BBff`, 10 B: modo (0 sintética/1 webcam), índice (0..9), FoV horizontal da webcam [graus], FoV virtual [graus]. Campo real 40..120, virtual 20..70 e virtual < real-5. Comprimento inválido: ACK_BAD_LEN; argumentos/importação inválidos: ACK_BAD_ARG. Abrir o dispositivo é assíncrono; um ACK OK não confirma a abertura: ler TM_CAMERA.
+- `TM_CAMERA` 0x06: `<BBBB8f` (36 B) seguido de mensagem UTF-8 até 180 B. Modo, estado, ponto detetado no vídeo completo, ponto dentro da vista virtual; FoV real/virtual, x/y do ponto na imagem normalizada 320x240, yaw/pitch da direção observada [graus], cobertura da vista virtual [0..1], idade do frame [s, -1 se ausente]. Estados: 0 sintética, 1 a abrir, 2 deteção, 3 sem ponto, 4 erro do dispositivo/dependência, 5 sem frame recente. Campos sem medida podem ser NaN.
+- `TM_VIDEO` 0x07: cabeçalho `<HBHH` (7 B): frame_id u16, vista u8 (0 vídeo completo/1 vista virtual), chunk u16, n_chunks u16; até 230 B de JPEG por chunk. IDs partilhados entre vistas, contador de 16 bits. Imagem em tons de cinzento 320x240. A estação limita a reconstrução a quatro frames pendentes e elimina frames incompletos após 1,5 s.
+- TM_IMG mantém o formato antigo para a cena sintética. A GUI representa ambas as resoluções nas coordenadas 320x240 para que o cursor corresponda aos pixels de TM_VISION.
+- No modo webcam, TM_VISION descreve a deteção no vídeo completo transformada para o referencial do corpo virtual e para a distância focal virtual configurada. x/y podem ficar fora de 320x240: o alvo continua no vídeo completo, mas fora da vista virtual. A área/contraste são do detector na imagem completa.
+- A observação usa a pose virtual guardada no instante de captura estimado. A história de poses evita subtrair a orientação atual a uma imagem atrasada. O campo óptico do núcleo é configurado por cc_set_camera_model; mudar de fonte limpa a aquisição anterior, sem recalibrar sensores.
+- A direção medida do ponto alimenta o controlo; o alvo do gimbal no modo webcam é uma direção observada, não uma verdade física conhecida. O modo não controla motores reais.
+
+
+## 11. Correções de modo webcam (v8)
+
+- `SIM_CAMERA_CENTER` 0xF8, sem payload: centra no eixo óptico da webcam, por controlo de atitude absoluta, sem alterar pose/integradores por imposição gráfica. Exige calibração concluída e modo webcam ativo ou sessão webcam-only. ACK_BAD_LEN para payload não vazio; ACK_BAD_ARG para modo errado/calibração pendente. Mantém HEADING nos três eixos até novo comando. FIXAR ALVO / TC_SET_MODE=TRACK retoma seguimento.
+- `TM_CAMERA` passa a `<BBBBB8f` (37 B) + mensagem UTF-8 até 180 B. Ordem: modo, estado, found, inside, intenção de controlo; depois os oito floats anteriores. Modo 0 = sintético; 1 = webcam ativa; 2 = sessão exclusiva de webcam sem fonte ligada. Intenção 0 = normal, 1 = a centrar/manter centro, 2 = aguardar primeira deteção para retomar TRACK.
+- TM_VIDEO agora transporta JPEG a cores BGR na codificação OpenCV e RGB após descodificação Qt. Cabeçalho de fragmentos e dimensões mantêm-se. Não interpretar o JPEG como matriz de cinzentos.
+- `--webcam-only` impede renderização/alvo sintético antes da abertura, durante erros e após desligar. Direções de alvo em TM_GIMBAL ficam NaN enquanto não há deteção real atual. A intenção de seguimento inicial mantém o centro até existir uma deteção válida.
+- `cc_point_absolute` converte a orientação absoluta pedida para o setpoint relativo à calibração e ativa HEADING; a massa/dinâmica/rodas não são reposicionadas.
+- Cor e região de papel são pré-processadas para o detector C; área/contraste continuam relativos à imagem de deteção normalizada. A imagem apresentada permanece a cores e sem as máscaras internas.
+
+
+## 12. Gestão de momento no gimbal (v9)
+
+- Formatos e limites mantidos. TM_STATE flags b5 = rotina de alívio de momento armada/ativa (pode ser suspensa enquanto recupera de perturbação grande). O erro transmitido permanece o erro de apontamento, sem subtrair a excursão interna de alívio. b1 continua a indicar velocidade medida acima de 95% do limite, independentemente de b5.
+- No byte de máscara de TM_SIM3, b0..b2 continuam a ser saturação roll/pitch/yaw; b3..b5 passam a indicar alívio nesses três eixos. A propriedade Python Sim3.unloading extrai os três bits superiores.
+- cc_set_gimbal_unload ativa explicitamente a rotina no adaptador de simulação do gimbal. A configuração por defeito do núcleo tem a rotina desligada: um sistema isolado sem apoio/atrito externo não descarrega momento desta forma. A rotina usa deslocamento limitado a 0,021817 rad, avanço lento de 0,01 rad/s e retorno limitado da referência, sem reposição de estados físicos. Ativa acima de 65% de wheel_lim e termina abaixo de 45%, após retornar a referência.
+- cc_set_search_limits permite ao adaptador limitar a procura de pitch a 15°/20° (alvo conhecido/desconhecido). Guinada usa 20°/160°. A direção inverte ao atingir o limite e o filtro de referência mantém o limite de aceleração.
+- A integração da malha de velocidade é suspensa durante movimento imposto fora da gama controlável ou movimento rápido oposto à referência. A proteção condicional de saturação do comando mantém-se.

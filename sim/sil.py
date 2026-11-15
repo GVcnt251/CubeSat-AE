@@ -55,6 +55,21 @@ class VisionT(C.Structure):
                [(n, C.c_float) for n in ("x", "y", "err_x", "err_y", "contrast")] + [("area", C.c_uint32)]
 
 
+class DetectionT(C.Structure):
+    _fields_ = [("found", C.c_uint8), ("n_cand", C.c_uint8), ("x", C.c_float),
+                ("y", C.c_float), ("area", C.c_int)] + [
+                    (n, C.c_float) for n in ("fill", "contrast", "bg", "threshold")]
+
+
+class DetectorConfig(C.Structure):
+    _fields_=[('dark_ratio',C.c_float),('min_area',C.c_int),('max_area',C.c_int)]+[
+        (n,C.c_float) for n in ('min_fill','max_fill','max_aspect','min_contrast','min_rel_contrast')]+[('min_bg',C.c_int)]
+
+
+class DetectorWorkspace(C.Structure):
+    _fields_=[('mask',C.c_uint32*2400),('stack',C.c_uint32*6144)]
+
+
 class MoteusStatus(C.Structure):
     _fields_ = [("have_mode", C.c_uint8), ("have_motion", C.c_uint8), ("have_aux", C.c_uint8),
                 ("mode", C.c_uint8), ("fault", C.c_uint8),
@@ -75,8 +90,7 @@ def _libname():
 def load_lib(rebuild=False):
     path = os.path.join(CORE_DIR, _libname())
     if rebuild or not os.path.exists(path):
-        subprocess.check_call(["make", "-C", CORE_DIR] if not rebuild else ["make", "-C", CORE_DIR, "-B"],
-                              stdout=subprocess.DEVNULL)
+        subprocess.check_call([sys.executable, os.path.join(ROOT, "compilar_core.py")])
     lib = C.CDLL(path)
     u8p = C.POINTER(C.c_uint8)
     lib.cc_create.restype = C.c_void_p
@@ -86,6 +100,19 @@ def load_lib(rebuild=False):
     lib.cc_on_mag.argtypes = [C.c_void_p, C.c_uint64, C.POINTER(C.c_float)]
     lib.cc_on_image.argtypes = [C.c_void_p, C.c_uint64, C.c_uint64, u8p, C.POINTER(VisionT)]
     lib.cc_on_image.restype = C.c_int
+    lib.cc_on_detection.argtypes = [C.c_void_p, C.c_uint64, C.c_uint64,
+                                    C.POINTER(DetectionT), C.POINTER(VisionT)]
+    lib.cc_on_detection.restype = C.c_int
+    lib.cc_set_camera_model.argtypes=[C.c_void_p,C.c_float,C.c_float]
+    lib.cc_set_camera_model.restype=C.c_int
+    lib.cc_clear_target.argtypes=[C.c_void_p]
+    lib.cc_point_absolute.argtypes=[C.c_void_p,C.c_float]
+    lib.cc_point_absolute.restype=C.c_int
+    lib.cc_set_search_limits.argtypes=[C.c_void_p,C.c_float,C.c_float]
+    lib.cc_set_search_limits.restype=C.c_int
+    lib.cc_set_gimbal_unload.argtypes=[C.c_void_p,C.c_int]
+    lib.cc_det_cfg_default.argtypes=[C.POINTER(DetectorConfig)]
+    lib.cc_detect.argtypes=[C.POINTER(DetectorConfig),C.POINTER(DetectorWorkspace),u8p,C.POINTER(DetectionT)]
     lib.cc_get_tlm.argtypes = [C.c_void_p, C.POINTER(TlmT)]
     for n, t in (("cmd", CmdT), ("meas", MeasT), ("out", OutT), ("tlm", TlmT), ("vision", VisionT)):
         f = getattr(lib, f"cc_sizeof_{n}")

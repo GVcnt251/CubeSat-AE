@@ -1,8 +1,9 @@
 #include "moteus_proto.h"
 #include <string.h>
 #include <math.h>
+#include "wire_le.h"
 
-static uint8_t *pf(uint8_t *p, float v) { memcpy(p, &v, 4); return p + 4; }
+static uint8_t *pf(uint8_t *p, float v) { cc_write_le_float(p, v); return p + 4; }
 
 static size_t fd_len(size_t n)
 {
@@ -31,6 +32,9 @@ uint32_t moteus_can_id(uint8_t src, uint8_t dst, int want_reply)
 
 size_t moteus_pack_velocity(uint8_t *buf, float vel, float max_torque, float accel, int q)
 {
+    if (!buf) return 0;
+    if (!isfinite(vel) || !isfinite(max_torque) || !isfinite(accel) ||
+        max_torque < 0.0f || accel < 0.0f) return moteus_pack_stop(buf, q);
     uint8_t *p = buf;
     *p++ = 0x01; *p++ = 0x00; *p++ = 10;                 /* modo = posição */
     *p++ = 0x0c; *p++ = 6; *p++ = 0x20;                  /* 6 floats a partir de 0x020 */
@@ -59,6 +63,7 @@ static int varuint(const uint8_t *b, size_t n, size_t *i, uint32_t *out)
     for (int k = 0; k < 5; k++) {
         if (*i >= n) return -1;
         uint8_t c = b[(*i)++];
+        if (k == 4 && (c & 0xf0)) return -1;
         v |= (uint32_t)(c & 0x7f) << sh; sh += 7;
         if (!(c & 0x80)) { *out = v; return 0; }
     }
@@ -68,7 +73,7 @@ static int varuint(const uint8_t *b, size_t n, size_t *i, uint32_t *out)
 /* valor de registo -> unidades SI, segundo as tabelas de mapeamento da documentação */
 static float scale(uint32_t reg, int bytes, int is_float, const uint8_t *v)
 {
-    if (is_float) { float f; memcpy(&f, v, 4); return f; }
+    if (is_float) { return cc_read_le_float(v); }
     int32_t x = bytes == 1 ? (int8_t)v[0] : bytes == 2 ? (int16_t)(v[0] | (v[1] << 8))
               : (int32_t)((uint32_t)v[0] | (uint32_t)v[1] << 8 | (uint32_t)v[2] << 16 | (uint32_t)v[3] << 24);
     static const float pos[3] = {0.01f, 0.0001f, 0.00001f};
@@ -89,7 +94,11 @@ static float scale(uint32_t reg, int bytes, int is_float, const uint8_t *v)
 
 int moteus_parse_reply(const uint8_t *b, size_t n, moteus_status_t *st)
 {
+    if (!st) return -1;
     memset(st, 0, sizeof(*st));
+    if (!b || n == 0 || n > 64) return -1;
+    moteus_status_t result = {0};
+    unsigned motion = 0, aux = 0;
     size_t i = 0;
     while (i < n) {
         uint8_t t = b[i++];
@@ -100,21 +109,39 @@ int moteus_parse_reply(const uint8_t *b, size_t n, moteus_status_t *st)
         uint32_t reg, c = (uint32_t)cnt;
         if (cnt == 0 && varuint(b, n, &i, &c) < 0) return -1;
         if (varuint(b, n, &i, &reg) < 0) return -1;
+        if (c == 0 || c > (n - i) / (size_t)bytes || reg > UINT32_MAX - (c - 1)) return -1;
         for (uint32_t k = 0; k < c; k++, reg++) {
             if (i + (size_t)bytes > n) return -1;
             float v = scale(reg, bytes, is_float, b + i);
             i += (size_t)bytes;
             switch (reg) {
-            case 0x000: st->mode = (uint8_t)v; st->have_mode = 1; break;
-            case 0x001: st->position_rev = v; st->have_motion = 1; break;
-            case 0x002: st->velocity_rev_s = v; break;
-            case 0x003: st->torque_nm = v; break;
-            case 0x00d: st->voltage_v = v; st->have_aux = 1; break;
-            case 0x00e: st->temp_c = v; break;
-            case 0x00f: st->fault = (uint8_t)v; break;
+            case 0x000:
+                if (!isfinite(v) || v < 0 || v > 255 || floorf(v) != v) return -1;
+                result.mode = (uint8_t)v; result.have_mode = 1; break;
+            case 0x001:
+                if (!isfinite(v)) return -1;
+                result.position_rev = v; motion |= 1; break;
+            case 0x002:
+                if (!isfinite(v)) return -1;
+                result.velocity_rev_s = v; motion |= 2; break;
+            case 0x003:
+                if (!isfinite(v)) return -1;
+                result.torque_nm = v; motion |= 4; break;
+            case 0x00d:
+                if (!isfinite(v)) return -1;
+                result.voltage_v = v; aux |= 1; break;
+            case 0x00e:
+                if (!isfinite(v)) return -1;
+                result.temp_c = v; aux |= 2; break;
+            case 0x00f:
+                if (!isfinite(v) || v < 0 || v > 255 || floorf(v) != v) return -1;
+                result.fault = (uint8_t)v; aux |= 4; break;
             default: break;
             }
         }
     }
+    result.have_motion = motion == 7;
+    result.have_aux = aux == 7;
+    *st = result;
     return 0;
 }

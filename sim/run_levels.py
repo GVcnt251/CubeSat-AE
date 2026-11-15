@@ -14,7 +14,7 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from cube_sim import CubeSim, IMG_W, IMG_H            # noqa: E402
+from cube_sim import CubeSim, SimParams, IMG_W, IMG_H            # noqa: E402
 from sil import *                                      # noqa: E402,F403
 
 import matplotlib                                      # noqa: E402
@@ -127,7 +127,7 @@ def level3():
 # ---------------------------------------------------------------- nível 4
 def level4(n=400):
     rng = np.random.default_rng(4)
-    sim = CubeSim(seed=41)
+    sim = CubeSim(params=SimParams(distractor=True), seed=41)
     core = Core()
     hits, errs_px, t_proc, fp, n_cov = 0, [], [], 0, 0
     for k in range(n):
@@ -271,7 +271,7 @@ def main():
     for r in rows:
         print(f"[{'PASS' if r['ok'] else 'FAIL'}] L{r['level']} {r['name']:<{w}}  | {r['criterion']}\n        -> {r['measured']}")
     print("=" * 100)
-    with open(os.path.join(RES, "summary.md"), "w") as f:
+    with open(os.path.join(RES, "summary.md"), "w", encoding="utf-8") as f:
         f.write("| Nível | Teste | Critério | Medido (SIL) | |\n|---|---|---|---|---|\n")
         for r in rows:
             f.write(f"| {r['level']} | {r['name']} | {r['criterion']} | {r['measured']} | {'✅' if r['ok'] else '❌'} |\n")

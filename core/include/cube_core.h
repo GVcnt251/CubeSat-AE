@@ -49,7 +49,8 @@ enum {
     CC_FLAG_WHEEL_SAT    = 1 << 1,
     CC_FLAG_MAG_OK       = 1 << 2,
     CC_FLAG_CALIBRATED   = 1 << 3,
-    CC_FLAG_TILT_HIGH    = 1 << 4
+    CC_FLAG_TILT_HIGH    = 1 << 4,
+    CC_FLAG_UNLOADING    = 1 << 5
 };
 
 typedef enum {
@@ -142,6 +143,9 @@ typedef struct {
     float wheel_lim, torque_max, wheel_accel;
     /* máquina de estados de seguimento */
     float t_lock, t_search, search_rate;
+    float search_span_known, search_span_unknown;
+    int gimbal_unload; /* Só quando existe atrito externo no apoio; desativado por omissão. */
+    uint32_t imu_timeout_us; /* Default 50000; internal, not TMTC. */
 } cc_config_t;
 
 typedef struct cc_s {
@@ -177,14 +181,42 @@ typedef struct cc_s {
     int entering_track;
     float wheel_meas;
 
+    int cam_covered;
+    float search_rot;
+    float search_center, search_span;
+    float unload_offset, unload_dir;
+    int unloading, unload_returning;
+
     cc_tlm_t tlm;
+    uint64_t imu_last_valid_us, imu_last_call_us;
+    int imu_seen, imu_call_seen, imu_missing, imu_recal_required, imu_recal_requested;
+    int imu_calibrated_once;
+    int search_target_known; /* Accepted target since the last calibration. */
+    int cam_seen;
+    uint64_t last_cam_capture_us; /* Last accepted capture: reject duplicates. */
+
 } cc_t;
 
 void cc_config_default(cc_config_t *cfg);
 void cc_init(cc_t *c, const cc_config_t *cfg);   /* cfg == NULL => valores por omissão */
+/* Invalid commands are ignored. Gains use SI units; zero Ki disables integration. */
+int cc_gain_valid(uint32_t id, float value);
 void cc_command(cc_t *c, const cc_cmd_t *cmd);
 
 /* Chamar a frequência fixa (ex.: 200 Hz). now_us = instante da amostra do IMU. */
+typedef enum {
+    CC_IMU_OK = 0,
+    CC_IMU_UNAVAILABLE,
+    CC_IMU_RECAL_REQUIRED
+} cc_imu_status_t;
+
+/* Valid means a fresh IMU sample for this cycle. Long gaps latch RECAL_REQUIRED.
+ * The latch clears only after a requested, continuous calibration completes.
+ * First recovered sample rebases time without prediction or PI integration.
+ * WHEEL may run with unavailable IMU after initial calibration; motor health
+ * must be enforced by the caller. All structures must be recompiled together. */
+cc_imu_status_t cc_step_with_imu(cc_t *c, uint64_t now_us,
+                               const cc_meas_t *m, int imu_valid, cc_out_t *out);
 void cc_step(cc_t *c, uint64_t now_us, const cc_meas_t *m, cc_out_t *out);
 
 /* Assíncronas */
@@ -195,6 +227,12 @@ int  cc_on_image(cc_t *c, uint64_t t_capture_us, uint64_t now_us, const uint8_t 
 int  cc_on_detection(cc_t *c, uint64_t t_capture_us, uint64_t now_us, const cc_det_t *det, cc_vision_t *out);
 
 void cc_get_tlm(const cc_t *c, cc_tlm_t *out);
+/* Adaptadores ópticos de SIL: não alteram estado/calibração dos sensores. */
+int cc_set_camera_model(cc_t *c, float fx, float fy);
+void cc_clear_target(cc_t *c);
+int cc_point_absolute(cc_t *c, float heading);
+int cc_set_search_limits(cc_t *c, float known_span, float unknown_span);
+void cc_set_gimbal_unload(cc_t *c, int enabled);
 
 /* Auxiliares para ligações (ctypes) */
 cc_t *cc_create(void);
