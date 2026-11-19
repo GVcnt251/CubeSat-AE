@@ -1,6 +1,9 @@
 #include "wheel.h"
+
 #include <math.h>
+#include <stdint.h>
 #include <string.h>
+
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "sdkconfig.h"
@@ -8,44 +11,81 @@
 #include "moteus_proto.h"
 
 static const char *TAG = "wheel";
+
 #define TWO_PI 6.28318530718f
+#define WHEEL_REPLY_TIMEOUT_US 50000ULL
+#define WHEEL_RX_LIMIT 64U
+
+static bool command_valid(const cc_out_t *command)
+{
+    return command != NULL &&
+           isfinite(command->wheel_cmd_rps) &&
+           isfinite(command->torque_max_nm) &&
+           isfinite(command->accel_limit_rps2) &&
+           command->torque_max_nm > 0.0f &&
+           command->accel_limit_rps2 > 0.0f;
+}
 
 #ifdef CONFIG_CUBE_WHEEL_FAKE
 
-/* Roda simulada: seguimento com limite de aceleração (sem moteus). */
-static float s_v;
-static uint64_t s_last;
+static float s_velocity[WHEEL_AXIS_COUNT];
+static uint64_t s_last_us;
+static bool s_have_time;
 
 int wheel_init(void)
 {
-    ESP_LOGW(TAG, "roda SIMULADA em software (CONFIG_CUBE_WHEEL_FAKE)");
+    memset(s_velocity, 0, sizeof(s_velocity));
+    s_last_us = 0;
+    s_have_time = false;
+
+    ESP_LOGW(TAG, "Three simulated wheels enabled");
     return 0;
 }
 
-wheel_state_t wheel_update(const cc_out_t *c)
+void wheels_update(
+    const cc_out_t commands[WHEEL_AXIS_COUNT],
+    wheel_state_t states[WHEEL_AXIS_COUNT])
 {
-    uint64_t now = (uint64_t)esp_timer_get_time();
-    float dt = s_last ? (float)(now - s_last) * 1e-6f : 0.005f;
-    s_last = now;
-
-    if (c->enable) {
-        float step = c->accel_limit_rps2 * dt;
-        float d = c->wheel_cmd_rps - s_v;
-        s_v += d > step ? step : (d < -step ? -step : d);
+    if (states == NULL) {
+        return;
     }
 
-    wheel_state_t w = {
-        .vel_rps = s_v,
-        .torque_nm = 0,
-        .vbat_v = 22.2f,
-        .valid = true,
-    };
-    return w;
+    uint64_t now = (uint64_t)esp_timer_get_time();
+    float dt = s_have_time
+        ? (float)(now - s_last_us) * 1e-6f
+        : 0.005f;
+
+    s_last_us = now;
+    s_have_time = true;
+
+    for (unsigned axis = 0; axis < WHEEL_AXIS_COUNT; ++axis) {
+        const cc_out_t *command =
+            commands != NULL ? &commands[axis] : NULL;
+
+        if (command_valid(command) && command->enable) {
+            float step = command->accel_limit_rps2 * dt;
+            float delta =
+                command->wheel_cmd_rps - s_velocity[axis];
+
+            s_velocity[axis] +=
+                fmaxf(-step, fminf(step, delta));
+        }
+
+        /*
+         * Disabled wheels coast at their current simulated velocity.
+         * This is a simple model, without friction or motor dynamics.
+         */
+        states[axis] = (wheel_state_t) {
+            .vel_rps = s_velocity[axis],
+            .torque_nm = 0.0f,
+            .vbat_v = 22.2f,
+            .valid = true
+        };
+    }
 }
 
 #else
 
-/* Moteus por CAN-FD. */
 typedef struct {
     wheel_state_t state;
     uint64_t last_reply_us;
@@ -53,90 +93,270 @@ typedef struct {
     bool motor_fault;
 } wheel_runtime_t;
 
-static wheel_runtime_t s_wheel;
+static wheel_runtime_t s_wheels[WHEEL_AXIS_COUNT];
 static bool s_can_ok;
+
+static const unsigned s_motor_id[WHEEL_AXIS_COUNT] = {
+    CONFIG_CUBE_MOTEUS_ID_X,
+    CONFIG_CUBE_MOTEUS_ID_Y,
+    CONFIG_CUBE_MOTEUS_ID
+};
+
+static const int s_sign[WHEEL_AXIS_COUNT] = {
+    CONFIG_CUBE_WHEEL_SIGN_X,
+    CONFIG_CUBE_WHEEL_SIGN_Y,
+    CONFIG_CUBE_WHEEL_SIGN
+};
+
+static const char *const s_axis_name[WHEEL_AXIS_COUNT] = {
+    "X", "Y", "Z"
+};
 
 int wheel_init(void)
 {
-    memset(&s_wheel, 0, sizeof(s_wheel));
+    memset(s_wheels, 0, sizeof(s_wheels));
+    s_can_ok = false;
+
+    unsigned configured = 0;
+
+    for (unsigned axis = 0; axis < WHEEL_AXIS_COUNT; ++axis) {
+        if (s_motor_id[axis] == 0) {
+            ESP_LOGW(TAG, "Wheel %s is not configured",
+                     s_axis_name[axis]);
+            continue;
+        }
+
+        if (s_motor_id[axis] > 127 ||
+            (s_sign[axis] != 1 && s_sign[axis] != -1)) {
+            ESP_LOGE(TAG, "Invalid configuration for wheel %s",
+                     s_axis_name[axis]);
+            return -1;
+        }
+
+        for (unsigned other = 0; other < axis; ++other) {
+            if (s_motor_id[axis] == s_motor_id[other]) {
+                ESP_LOGE(TAG,
+                         "Duplicate CAN ID for wheels %s and %s",
+                         s_axis_name[other], s_axis_name[axis]);
+                return -1;
+            }
+        }
+
+        configured++;
+    }
+
+    if (configured == 0) {
+        ESP_LOGE(TAG, "No wheels configured");
+        return -1;
+    }
 
     s_can_ok = can_port_init() == ESP_OK;
     return s_can_ok ? 0 : -1;
 }
 
-wheel_state_t wheel_update(const cc_out_t *c)
+static void wheel_apply_reply(
+    unsigned axis,
+    const moteus_status_t *status)
 {
-    if (!s_can_ok) {
-        s_wheel.state.valid = false;
-        return s_wheel.state;
+    wheel_runtime_t *wheel = &s_wheels[axis];
+
+    /*
+     * A reported fault blocks actuation immediately, even when
+     * the reply does not contain all requested measurements.
+     */
+    if (status->have_aux && status->fault != 0) {
+        if (!wheel->motor_fault) {
+            ESP_LOGE(TAG, "Wheel %s fault: %u",
+                     s_axis_name[axis],
+                     (unsigned)status->fault);
+        }
+
+        wheel->motor_fault = true;
+        wheel->state.valid = false;
     }
 
-    const float sign =
-        (CONFIG_CUBE_WHEEL_SIGN < 0) ? -1.0f : 1.0f;
+    /*
+     * Only complete replies refresh feedback and clear a previous
+     * fault. Partial replies cannot make an old state usable.
+     */
+    if (!status->have_mode ||
+        !status->have_motion ||
+        !status->have_aux) {
+        return;
+    }
 
-    /* Receber e verificar o estado antes de escolher o comando. */
-    can_frame_t r;
-    while (can_port_recv(&r)) {
-        if (r.id != moteus_can_id(CONFIG_CUBE_MOTEUS_ID, 0, 0)) {
+    if (!isfinite(status->velocity_rev_s) ||
+        !isfinite(status->torque_nm) ||
+        !isfinite(status->voltage_v)) {
+        wheel->have_reply = false;
+        wheel->state.valid = false;
+        return;
+    }
+
+    float velocity =
+        (float)s_sign[axis] * status->velocity_rev_s * TWO_PI;
+
+    if (!isfinite(velocity)) {
+        wheel->have_reply = false;
+        wheel->state.valid = false;
+        return;
+    }
+
+    wheel->state.vel_rps = velocity;
+    wheel->state.torque_nm =
+        (float)s_sign[axis] * status->torque_nm;
+    wheel->state.vbat_v = status->voltage_v;
+
+    wheel->motor_fault = status->fault != 0;
+    wheel->last_reply_us = (uint64_t)esp_timer_get_time();
+    wheel->have_reply = true;
+}
+
+static void wheels_receive(void)
+{
+    can_frame_t frame;
+
+    /*
+     * Bound work per call so a busy CAN bus cannot keep this
+     * control task inside the receive loop indefinitely.
+     */
+    for (unsigned received = 0;
+         received < WHEEL_RX_LIMIT;
+         ++received) {
+        if (!can_port_recv(&frame)) {
+            break;
+        }
+
+        if (frame.len > sizeof(frame.data)) {
             continue;
         }
 
-        moteus_status_t st;
-        if (moteus_parse_reply(r.data, r.len, &st) != 0) {
-            continue;
-        }
-
-        if (st.have_motion) {
-            s_wheel.state.vel_rps = sign * st.velocity_rev_s * TWO_PI;
-            s_wheel.state.torque_nm = sign * st.torque_nm;
-        }
-
-        if (st.have_aux) {
-            s_wheel.state.vbat_v = st.voltage_v;
-
-            bool fault = st.fault != 0;
-            if (fault && !s_wheel.motor_fault) {
-                ESP_LOGE(TAG, "moteus em falha: código %u", st.fault);
+        for (unsigned axis = 0;
+             axis < WHEEL_AXIS_COUNT;
+             ++axis) {
+            if (s_motor_id[axis] == 0) {
+                continue;
             }
-            s_wheel.motor_fault = fault;
-        }
 
-        if (st.have_mode && st.have_motion && st.have_aux) {
-            s_wheel.last_reply_us = (uint64_t)esp_timer_get_time();
-            s_wheel.have_reply = true;
+            if (frame.id !=
+                moteus_can_id(s_motor_id[axis], 0, 0)) {
+                continue;
+            }
+
+            moteus_status_t status = { 0 };
+
+            if (moteus_parse_reply(
+                    frame.data, frame.len, &status) == 0) {
+                wheel_apply_reply(axis, &status);
+            }
+
+            break;
         }
     }
+}
 
-    s_wheel.state.valid = s_wheel.have_reply && !s_wheel.motor_fault &&
-        ((uint64_t)esp_timer_get_time() - s_wheel.last_reply_us < 50000);
+static void wheel_send(
+    unsigned axis,
+    const cc_out_t *command)
+{
+    wheel_runtime_t *wheel = &s_wheels[axis];
+    uint8_t buffer[64];
+    size_t length;
 
-    /* Sem estado válido, enviar STOP com pedido de resposta. */
-    uint8_t buf[64];
-    size_t n;
+    bool enabled = command_valid(command) &&
+                   command->enable &&
+                   wheel->state.valid;
 
-    if (c->enable && s_wheel.state.valid) {
-        n = moteus_pack_velocity(
-            buf,
-            sign * c->wheel_cmd_rps / TWO_PI,
-            c->torque_max_nm,
-            c->accel_limit_rps2 / TWO_PI,
+    if (enabled) {
+        length = moteus_pack_velocity(
+            buffer,
+            (float)s_sign[axis] *
+                command->wheel_cmd_rps / TWO_PI,
+            command->torque_max_nm,
+            command->accel_limit_rps2 / TWO_PI,
             1);
     } else {
-        n = moteus_pack_stop(buf, 1);
+        /* STOP also requests feedback, allowing initial discovery. */
+        length = moteus_pack_stop(buffer, 1);
     }
 
-    can_frame_t f = {
-        .id = moteus_can_id(0, CONFIG_CUBE_MOTEUS_ID, 1),
-        .len = (uint8_t)n,
+    can_frame_t frame = {
+        .id = moteus_can_id(0, s_motor_id[axis], 1),
+        .len = 0
     };
-    memcpy(f.data, buf, n);
 
-    if (can_port_send(&f) != ESP_OK) {
-        s_wheel.state.valid = false;
-        s_wheel.have_reply = false;
+    if (length == 0 || length > sizeof(frame.data)) {
+        wheel->state.valid = false;
+        wheel->have_reply = false;
+        return;
     }
 
-    return s_wheel.state;
+    frame.len = (uint8_t)length;
+    memcpy(frame.data, buffer, length);
+
+    if (can_port_send(&frame) != ESP_OK) {
+        wheel->state.valid = false;
+        wheel->have_reply = false;
+    }
+}
+
+void wheels_update(
+    const cc_out_t commands[WHEEL_AXIS_COUNT],
+    wheel_state_t states[WHEEL_AXIS_COUNT])
+{
+    if (states == NULL) {
+        return;
+    }
+
+    if (!s_can_ok) {
+        for (unsigned axis = 0;
+             axis < WHEEL_AXIS_COUNT;
+             ++axis) {
+            s_wheels[axis].state.valid = false;
+            states[axis] = s_wheels[axis].state;
+        }
+        return;
+    }
+
+    /* Receive once and route replies to their corresponding wheel. */
+    wheels_receive();
+
+    uint64_t now = (uint64_t)esp_timer_get_time();
+
+    for (unsigned axis = 0; axis < WHEEL_AXIS_COUNT; ++axis) {
+        wheel_runtime_t *wheel = &s_wheels[axis];
+
+        wheel->state.valid =
+            s_motor_id[axis] != 0 &&
+            wheel->have_reply &&
+            !wheel->motor_fault &&
+            (now - wheel->last_reply_us <
+                WHEEL_REPLY_TIMEOUT_US);
+    }
+
+    for (unsigned axis = 0; axis < WHEEL_AXIS_COUNT; ++axis) {
+        if (s_motor_id[axis] != 0) {
+            const cc_out_t *command =
+                commands != NULL ? &commands[axis] : NULL;
+
+            wheel_send(axis, command);
+        }
+
+        states[axis] = s_wheels[axis].state;
+    }
 }
 
 #endif
+
+wheel_state_t wheel_update(const cc_out_t *command)
+{
+    cc_out_t commands[WHEEL_AXIS_COUNT] = { 0 };
+    wheel_state_t states[WHEEL_AXIS_COUNT] = { 0 };
+
+    if (command != NULL) {
+        commands[WHEEL_AXIS_Z] = *command;
+    }
+
+    wheels_update(commands, states);
+    return states[WHEEL_AXIS_Z];
+}
