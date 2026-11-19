@@ -31,13 +31,14 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         esp_wifi_connect();
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
-        ESP_LOGI(TAG, "IP " IPSTR " - ligar a estação de terra a esta morada, UDP %d", IP2STR(&e->ip_info.ip), CONFIG_CUBE_GS_PORT);
+        ESP_LOGI(TAG, "IP " IPSTR " - ligar a estaÃ§Ã£o de terra a esta morada, UDP %d", IP2STR(&e->ip_info.ip), CONFIG_CUBE_GS_PORT);
         s_ip_ok = true;
     }
 }
 
 void comms_init(void)
 {
+    
     s_tx_mtx = xSemaphoreCreateMutex();
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -52,7 +53,7 @@ void comms_init(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
     ESP_ERROR_CHECK(esp_wifi_start());
-    esp_wifi_set_ps(WIFI_PS_NONE);                 /* sem poupança de energia: latência previsível */
+    esp_wifi_set_ps(WIFI_PS_NONE);                 /* sem poupanÃ§a de energia: latÃªncia previsÃvel */
 }
 
 static void send_frame(uint8_t type, const uint8_t *pl, uint8_t len)
@@ -77,7 +78,7 @@ void comms_send_image(const uint8_t *gray)
     s_img_id++;
     for (int c = 0; c < CC_IMG_NCHUNKS; c++) {
         send_frame(TM_IMG, pl, (uint8_t)cc_pack_tm_img_chunk(pl, gray, s_img_id, (uint8_t)c));
-        if ((c & 3) == 3) vTaskDelay(pdMS_TO_TICKS(2));    /* não afogar os buffers do Wi-Fi */
+        if ((c & 3) == 3) vTaskDelay(pdMS_TO_TICKS(2));    /* nÃ£o afogar os buffers do Wi-Fi */
     }
 }
 
@@ -86,11 +87,11 @@ static void handle_tc(uint8_t type, uint8_t seq, const uint8_t *p, uint8_t len)
     uint8_t status = ACK_OK;
     if (type == TC_PING) {
     if (len != 0) {
-        status = 1;  // Erro: comprimento inválido
+        status = 1;  // Erro: comprimento invÃ¡lido
     }
 } else if (type == TC_STREAM_CFG) {
     if (len != 3) {
-        status = 1;  // Erro: comprimento inválido
+        status = 1;  // Erro: comprimento invÃ¡lido
     } else {
         g_state_hz = p[0];
         g_vision_hz = p[1];
@@ -99,7 +100,12 @@ static void handle_tc(uint8_t type, uint8_t seq, const uint8_t *p, uint8_t len)
     } else {
         cc_cmd_t cmd;
         int r = cc_tc_to_cmd(type, p, len, &cmd);
-        if (r == 1) { CORE_LOCK(); cc_command(&g_core, &cmd); CORE_UNLOCK(); }
+        if (r == 1) {
+            CORE_LOCK();
+            int applied = cc3_command_legacy(&g_core, &cmd);
+            CORE_UNLOCK();
+            if (!applied) status = ACK_BAD_ARG;
+        }
         else if (r < 0) status = (uint8_t)(-r);
         else status = ACK_UNKNOWN;
     }
@@ -135,7 +141,7 @@ void comms_task(void *arg)
 
                 for (int i = 0; i < n; i++) {
                     if (cc_parser_feed(&parser, rx[i])) {
-                        // A trama tem de terminar no último byte
+                        // A trama tem de terminar no Ãºltimo byte
                         if (i != n - 1) {
                             valid = false;
                             break;
@@ -144,7 +150,7 @@ void comms_task(void *arg)
                     }
                 }
 
-                // Só aceitar uma trama completa por datagrama
+                // SÃ³ aceitar uma trama completa por datagrama
                 if (valid &&
                     n == parser.len + 7 &&
                     rx[0] == 0xA5 &&
@@ -152,7 +158,7 @@ void comms_task(void *arg)
                     parser.type >= TC_PING &&
                     parser.type <= TC_RECAL) {
 
-                    // Guardar o endereço apenas após validar a trama
+                    // Guardar o endereÃ§o apenas apÃ³s validar a trama
                     xSemaphoreTake(s_tx_mtx, portMAX_DELAY);
                     s_client = from;
                     s_have_client = true;
@@ -170,7 +176,7 @@ void comms_task(void *arg)
                 cc_tlm_t t;
 
                 CORE_LOCK();
-                cc_get_tlm(&g_core, &t);
+                cc3_get_legacy_tlm(&g_core, &t);
                 CORE_UNLOCK();
                 
                 uint8_t pl[64];

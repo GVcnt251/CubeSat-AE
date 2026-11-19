@@ -1,11 +1,11 @@
 /*
- * app_main.c - liga o núcleo de controlo (core/) ao hardware.
+ * app_main.c - liga o nÃºcleo de controlo (core/) ao hardware.
  *
- *   control_task  200 Hz, núcleo 1, prioridade 20 : IMU -> cc_step -> roda (moteus)
- *   camera_task   ~20 fps, núcleo 0               : câmara -> cc_detect -> cc_on_detection
- *   comms_task    200 Hz, núcleo 0                : UDP (TC in, TM out)
+ *   control_task  200 Hz, nÃºcleo 1, prioridade 20 : IMU -> cc3_step_with_imu -> roda (moteus)
+ *   camera_task   ~20 fps, nÃºcleo 0               : cÃ¢mara -> cc_detect -> cc3_on_detection
+ *   comms_task    200 Hz, nÃºcleo 0                : UDP (TC in, TM out)
  *
- * Nada de lógica de controlo aqui: está toda em core/, igual ao simulador (SIL).
+ * Nada de lÃ³gica de controlo aqui: estÃ¡ toda em core/, igual ao simulador (SIL).
  */
 #include <string.h>
 #include "esp_log.h"
@@ -22,10 +22,14 @@
 
 static const char *TAG = "cube";
 
-cc_t g_core;
+cc3_t g_core;
 SemaphoreHandle_t g_core_mtx;
 
 static bool s_imu_ok;
+
+/* DisponibilizaÃ§Ã£o dos mÃ³dulos necessÃ¡rios, etiqueta de diagnÃ³stico 
+preparaÃ§Ã£o do estado partilhado de controlo, proteÃ§Ã£o por mutex e indicador
+da inicializaÃ§Ã£o da IMU*/
 
 static void control_task(void *arg)
 {
@@ -39,9 +43,12 @@ static void control_task(void *arg)
         uint32_t stale = 0;
     #endif
     float vbat = 0;
-    cc_out_t out = { 0 };
+    cc3_out_t out = { 0 };
     imu_sample_t s = { 0 };
-    wheel_state_t w = { 0 };
+    wheel_state_t w[WHEEL_AXIS_COUNT] = { 0 };
+    
+    /*PreparaÃ§Ã£o para funcionamento a 200HZ (Control_hz), guarda separadamente
+    mediÃ§Ãµes e comandos e verifica atrasos e/ou ausÃªncia da resposta da wheel*/
 
     for (;;) {
         if (xTaskDelayUntil(&last, period) == pdFALSE) late++;      /* perdeu o prazo */
@@ -53,41 +60,80 @@ static void control_task(void *arg)
             imu_sample_ok = imu_read(&s) == ESP_OK;
         }
 
-        float mag[3];
-        bool have_mag = (n % MAG_DIV == 0) && mag_read(mag) == ESP_OK;
+        float mag[3] = { 0 };
+        bool have_mag = imu_sample_ok &&
+            (n % MAG_DIV == 0) && mag_read(mag) == ESP_OK;
         if (n % 40 == 0) vbat = battery_read_v();
 
-        cc_meas_t m = { .wheel_rps = w.vel_rps, .wheel_torque = w.torque_nm, .vbat_v = vbat > 0 ? vbat : w.vbat_v };
+        cc3_meas_t m = { 0 };
+        m.vbat_v = vbat > 0.0f ? vbat : 0.0f;
+        m.mag_valid = have_mag;
+        if (have_mag) {
+            memcpy(m.mag, mag, sizeof(m.mag));
+        }
+
+        for (unsigned axis = 0; axis < WHEEL_AXIS_COUNT; ++axis) {
+            m.wheel_rps[axis] = w[axis].vel_rps;
+            m.wheel_torque[axis] = w[axis].torque_nm;
+            if (w[axis].valid) {
+                m.motor_valid_mask |= (uint8_t)(1u << axis);
+                if (m.vbat_v <= 0.0f && w[axis].vbat_v > 0.0f) {
+                    m.vbat_v = w[axis].vbat_v;
+                }
+            }
+        }
         memcpy(m.gyro, s.gyro, sizeof(m.gyro));
         memcpy(m.accel, s.accel, sizeof(m.accel));
 
         CORE_LOCK();
-
-        cc_imu_status_t imu_status = cc_step_with_imu(
+        /*a tarefa espera pelo instante previsto, tenta ler os sensores Ã s respetivas 
+        frequÃªncias, reÃºne as mediÃ§Ãµes e sÃ³ depois obtÃ©m acesso exclusivo ao nÃºcleo. 
+        AtÃ© aqui, ainda nÃ£o calculou nem enviou um novo comando Ã  roda.*/
+        
+        cc_imu_status_t imu_status = cc3_step_with_imu(
             &g_core, t, &m, imu_sample_ok, &out);
 
         cc_mode_t mode = g_core.mode;
 
-        if (have_mag && imu_sample_ok &&
-            (imu_status == CC_IMU_OK || mode == CC_MODE_CALIB)) {
-            cc_on_mag(&g_core, t, mag);
-        }
-
         CORE_UNLOCK();
 
-        /* Sem IMU utilizável, bloquear modos dependentes da orientação. */
+        /* Sem IMU utilizÃ¡vel, bloquear modos dependentes da orientaÃ§Ã£o. */
         if (imu_status != CC_IMU_OK && mode != CC_MODE_WHEEL) {
-            out.enable = 0;
-        }
-        w = wheel_update(&out);                                     /* envia já o comando; o estado serve o ciclo seguinte */
-#ifndef CONFIG_CUBE_WHEEL_FAKE
-        if (!w.valid) {
-            if (++stale == 40) {                                    /* 200 ms sem resposta do moteus */
-                cc_cmd_t idle = { .type = CC_CMD_MODE, .a = CC_MODE_IDLE };
-                CORE_LOCK(); cc_command(&g_core, &idle); CORE_UNLOCK();
-                ESP_LOGE(TAG, "moteus sem resposta: modo IDLE");
+            for (unsigned axis = 0; axis < WHEEL_AXIS_COUNT; ++axis) {
+                out.axis[axis].enable = 0;
             }
-        } else stale = 0;
+        }
+        wheels_update(out.axis, w);                                     /* envia jÃ¡ o comando; o estado serve o ciclo seguinte */
+#ifndef CONFIG_CUBE_WHEEL_FAKE
+        /* All motors are required in the attitude-dependent modes.
+         * WHEEL keeps independent operation of each available motor.
+         * The core and wheel driver already guard actuation each cycle.
+         */
+        bool all_motors_valid = true;
+        for (unsigned axis = 0; axis < WHEEL_AXIS_COUNT; ++axis) {
+            all_motors_valid = all_motors_valid && w[axis].valid;
+        }
+        bool needs_all_motors = mode == CC_MODE_RATE ||
+            mode == CC_MODE_HEADING || mode == CC_MODE_TRACK;
+
+        if (needs_all_motors && !all_motors_valid) {
+            if (++stale == 40) { /* 40 cycles: nominally 200 ms at 200 Hz. */
+                cc_cmd_t idle = { .type = CC_CMD_MODE, .a = CC_MODE_IDLE };
+                CORE_LOCK();
+                int applied = cc3_command_legacy(&g_core, &idle);
+                CORE_UNLOCK();
+                if (applied) {
+                    ESP_LOGE(TAG, "Motor feedback unavailable: mode IDLE");
+                }
+            }
+        } else {
+            stale = 0;
+        }
+/*o nÃºcleo calcula, o firmware aplica a proteÃ§Ã£o da IMU, o mÃ³dulo da roda 
+comunica com o hardware e a ausÃªncia consecutiva de respostas provoca um pedido 
+interno de IDLE. A leitura do cÃ³digo demonstra essa sequÃªncia; 
+a paragem efetiva da roda exige validaÃ§Ã£o no sistema fÃsico.*/
+
 #endif
         uint64_t cycle_us = (uint64_t)esp_timer_get_time() - t;
 
@@ -113,6 +159,11 @@ static void control_task(void *arg)
     }
 }
 
+/*o firmware mede a duraÃ§Ã£o do trabalho, guarda o mÃ¡ximo e conta ultrapassagens 
+e atrasos. Esses registos ajudam a verificar o cumprimento dos 200 Hz nas 
+condiÃ§Ãµes ensaiadas, mas nÃ£o demonstram, por si sÃ³, que o controlo 
+fÃsico do CubeSat funciona corretamente.*/
+
 void app_main(void)
 {
     esp_err_t e = nvs_flash_init();
@@ -128,21 +179,32 @@ ESP_ERROR_CHECK(e);
     g_core_mtx = xSemaphoreCreateMutex();
 
     if (g_core_mtx == NULL) {
-        ESP_LOGE(TAG, "Falha ao criar mutex do núcleo");
+        ESP_LOGE(TAG, "Falha ao criar mutex do nÃºcleo");
         return;
     }
 
-cc_init(&g_core, NULL);
+    if (!cc3_init(&g_core, NULL)) {
+        ESP_LOGE(TAG, "Failed to initialize the three-axis core");
+        ESP_ERROR_CHECK(ESP_FAIL);
+    }
+    const float calib_s = g_core.cfg.axis[WHEEL_AXIS_Z].calib_s;
     if (battery_init() != 0) {
-    ESP_LOGE(TAG, "Falha na inicialização da leitura da bateria");
+    ESP_LOGE(TAG, "Falha na inicializaÃ§Ã£o da leitura da bateria");
     }
     s_imu_ok = imu_init() == ESP_OK;
     if (!s_imu_ok) {
         ESP_LOGE(TAG,
-                "Falha na inicialização da IMU: corrigir a causa e reiniciar o ESP32. "
-                "WHEEL requer calibração inicial concluída.");
+                "Falha na inicializaÃ§Ã£o da IMU: corrigir a causa e reiniciar o ESP32. "
+                "WHEEL requer calibraÃ§Ã£o inicial concluÃda.");
     }
-    if (wheel_init() != 0) ESP_LOGE(TAG, "roda indisponível (driver CAN)");
+
+    /*Se NVS permanecer indisponÃvel, provoca a interrupÃ§Ã£o fatal da execuÃ§Ã£o normal, 
+    se houver uma falha no mutex hÃ¡ o registo do erro e a saÃda da app_main, 
+    se houver um erro da inicializaÃ§Ã£o da bateria, hÃ¡ o registo do erro e a 
+    continuaÃ§Ã£o do programa e se houver uma falha na inicializaÃ§Ã£o da IMU, 
+    hÃ¡ o registo do erro, o indicaÃ§Ã£o de leitura a falso, mas a continuaÃ§Ã£o.*/
+
+    if (wheel_init() != 0) ESP_LOGE(TAG, "roda indisponÃvel (driver CAN)");
     comms_init();
 
         BaseType_t task_result;
@@ -157,15 +219,24 @@ cc_init(&g_core, NULL);
         task_result = xTaskCreatePinnedToCore(
             comms_task, "comms", 6144, NULL, 5, NULL, 0);
         if (task_result != pdPASS) {
-            ESP_LOGE(TAG, "Falha ao criar tarefa de comunicações");
+            ESP_LOGE(TAG, "Falha ao criar tarefa de comunicaÃ§Ãµes");
             ESP_ERROR_CHECK(ESP_FAIL);
         }
 
         task_result = xTaskCreatePinnedToCore(
             camera_task, "camera", 8192, NULL, 6, NULL, 0);
         if (task_result != pdPASS) {
-            ESP_LOGE(TAG, "Falha ao criar tarefa da câmara");
+            ESP_LOGE(TAG, "Falha ao criar tarefa da cÃ¢mara");
             ESP_ERROR_CHECK(ESP_FAIL);
         }
-    ESP_LOGI(TAG, "cubo a arrancar: calibração do giroscópio nos primeiros %.1f s (cubo PARADO)", g_core.cfg.calib_s);
+    ESP_LOGI(TAG, "cubo a arrancar: calibraÃ§Ã£o do giroscÃ³pio nos primeiros %.1f s (cubo PARADO)", calib_s);
 }
+/*20, 5 e 6 Ã© a prioridade. Prioridade maior significa preferÃªncia de 
+execuÃ§Ã£o quando existem tarefas prontas a executar no mesmo nÃºcleo
+(nÃ£o Ã© uma percentagem fixa do processador).
+
+O app_main.c inicializa os mÃ³dulos do CubeSat e cria as tarefas de controlo, 
+cÃ¢mara e comunicaÃ§Ãµes. A tarefa de controlo funciona nominalmente a 200 Hz, 
+reÃºne mediÃ§Ãµes, chama o nÃºcleo de controlo e envia os comandos Ã  roda.
+Protege o acesso ao nÃºcleo com um mutex, aplica proteÃ§Ãµes 
+perante falhas e regista os tempos de execuÃ§Ã£o e atrasos.*/

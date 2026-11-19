@@ -10,7 +10,7 @@
 #include "target_detect.h"
 
 static const char *TAG = "camera";
-static cc_det_ws_t s_ws;           /* workspace só desta tarefa (o do núcleo não é usado no firmware) */
+static cc_det_ws_t s_ws;           /* workspace sÃ³ desta tarefa (o do nÃºcleo nÃ£o Ã© usado no firmware) */
 
 /* Seeed XIAO ESP32S3 Sense */
 static camera_config_t cam_cfg(void)
@@ -31,12 +31,12 @@ void camera_task(void *arg)
 {
     camera_config_t cfg = cam_cfg();
     if (esp_camera_init(&cfg) != ESP_OK) {
-        ESP_LOGE(TAG, "esp_camera_init falhou: o cubo fica SEM visão (modos IDLE/WHEEL/RATE/HEADING continuam a funcionar)");
+        ESP_LOGE(TAG, "esp_camera_init falhou: o cubo fica SEM visÃ£o (modos IDLE/WHEEL/RATE/HEADING continuam a funcionar)");
         vTaskDelete(NULL);
         return;
     }
     cc_det_cfg_t det_cfg;
-    CORE_LOCK(); det_cfg = g_core.cfg.det; CORE_UNLOCK();
+    CORE_LOCK(); det_cfg = g_core.cfg.axis[2].det; CORE_UNLOCK();
 
     uint32_t n = 0;
     for (;;) {
@@ -49,15 +49,21 @@ void camera_task(void *arg)
             continue;
         }
         uint64_t t0 = (uint64_t)esp_timer_get_time();
-        uint64_t t_cap = t0 - (uint64_t)CONFIG_CUBE_CAM_LATENCY_MS * 1000ULL;
+        uint64_t latency_us = (uint64_t)CONFIG_CUBE_CAM_LATENCY_MS * 1000ULL;
+        if (t0 < latency_us) {
+            esp_camera_fb_return(fb);
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+        uint64_t t_cap = t0 - latency_us;
 
         cc_det_t det;
         cc_detect(&det_cfg, &s_ws, fb->buf, &det);                 /* pesado: fora do mutex */
         uint32_t proc_us = (uint32_t)((uint64_t)esp_timer_get_time() - t0);
 
-        cc_vision_t vis;
+        cc_vision_t vis = { 0 };
         CORE_LOCK();
-        cc_on_detection(&g_core, t_cap, (uint64_t)esp_timer_get_time(), &det, &vis);   /* leve */
+        cc3_on_detection(&g_core, t_cap, (uint64_t)esp_timer_get_time(), &det, &vis);   /* leve */
         CORE_UNLOCK();
 
         if (g_vision_hz) comms_send_vision(&vis, proc_us);
