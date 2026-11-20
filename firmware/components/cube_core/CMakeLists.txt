@@ -7,6 +7,7 @@ idf_component_register(
         "${CORE_DIR}/src/cube_core3.c"
         "${CORE_DIR}/src/target_detect.c"
         "${CORE_DIR}/src/cc_proto.c"
+        "${CORE_DIR}/src/cc_proto3.c"
         "${CORE_DIR}/src/moteus_proto.c"
     INCLUDE_DIRS
         "${CORE_DIR}/include"
