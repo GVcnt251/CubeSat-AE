@@ -29,6 +29,9 @@ class Link:
         try:
             if type_ == P.TM_STATE:
                 return ("state", P.decode_state(payload))
+            if type_ == 0x08 and len(payload) == 159 and payload[0] == 1:
+                axes = tuple(P.decode_state(payload[i:i+52]) for i in (3,55,107))
+                return ('state3', (payload[1],payload[2],axes))
             if type_ == P.TM_SIM3:
                 return ('sim3', P.decode_sim3(payload))
             if type_ == P.TM_GIMBAL:

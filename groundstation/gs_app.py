@@ -6,6 +6,7 @@ Totalmente compatível com TMTC_ICD.md (TM_STATE de 52 bytes).
 import argparse
 import csv
 import math
+import ipaddress
 import sys
 import time
 from collections import deque
@@ -16,6 +17,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 
 import gs_protocol as P
 from gs_link import SerialLink, UdpLink
+from gs_instruments import Instruments, button, disabled
 
 HIST = 600  # amostras por gráfico (30 s a 20 Hz)
 
@@ -368,8 +370,12 @@ class Cube3DWidget(QtWidgets.QWidget):
 
 
 class MainWindow(QtWidgets.QMainWindow):
-    def __init__(self, link, title="Cubo - estação de terra", img_every=10, auto_track=False,webcam_only=False, managed_session=False):
+    def __init__(self, link, title="Cubo - estação de terra", img_every=10, auto_track=False,webcam_only=False, managed_session=False, environment=0, simulation_port=5000):
         super().__init__()
+        self.environment = environment
+        self.simulation_port = simulation_port
+        self.next_connection = None
+        self.transport_error = False
         self.link = link
         self.managed_session = managed_session
         self.session_exit = 0
@@ -435,6 +441,12 @@ class MainWindow(QtWidgets.QMainWindow):
         heading = QtWidgets.QLabel('CUBESAT  /  MISSION CONTROL')
         heading.setStyleSheet('font-size: 21px; font-weight: 700; color: #183251;')
         header.addWidget(heading); header.addStretch()
+        self.instrument_status = QtWidgets.QLabel('A aguardar telemetria')
+        header.addWidget(self.instrument_status)
+        stop = button('STOP · IDLE', self.stop_control)
+        stop.setStyleSheet('background:#b83232;color:white;font-weight:bold;padding:7px 14px')
+        stop.setToolTip('Pede modo IDLE e cancela o seguimento automático.')
+        header.addWidget(stop)
         self.chk_log = QtWidgets.QCheckBox('Registar dados em CSV')
         self.chk_log.toggled.connect(self._toggle_log)
         header.addWidget(self.chk_log); outer.addLayout(header)
@@ -463,6 +475,7 @@ class MainWindow(QtWidgets.QMainWindow):
         grid.addLayout(right,1)
         advanced = QtWidgets.QScrollArea(); advanced.setWidgetResizable(True)
         advanced.setWidget(self._build_advanced()); self.tabs.addTab(advanced, 'Definições avançadas')
+        self.instruments = Instruments(self)
 
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.tick)
@@ -471,7 +484,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.send(P.tc_stream, 20, 20, self.img_every)
 
     def send(self, make, *args):
-        self.link.send_frame(make, *args)
+        if self.transport_error or (self.environment and make.__name__.startswith('sim_')):
+            return
+        try:
+            self.link.send_frame(make, *args)
+        except OSError as exc:
+            self._connection_error(exc)
+            return
+        if make is P.tc_ping and hasattr(self.link,'seq'):
+            self.instruments.echo = (self.link.seq,time.monotonic())
+        if make is P.tc_mode:
+            self.instruments.put('Controlo','Modo pedido',P.MODES.get(args[0],'—'),time.monotonic())
 
     def fix_target(self):
         self.center_pending=False
@@ -502,20 +525,24 @@ class MainWindow(QtWidgets.QMainWindow):
         session = QtWidgets.QGroupBox('Sessão')
         form = QtWidgets.QVBoxLayout(session)
         self.environment_selector = QtWidgets.QComboBox()
-        self.environment_selector.addItems(['Simulação', 'CubeSat real · em breve'])
-        self.environment_selector.model().item(1).setEnabled(False)
-        self.environment_selector.setToolTip('A ligação ao CubeSat real será integrada numa fase posterior.')
+        self.environment_selector.addItems(['Simulação', 'CubeSat · Wi-Fi', 'CubeSat · USB'])
+        self.environment_selector.setCurrentIndex(self.environment)
+        self.environment_selector.activated[int].connect(self._choose_connection)
         form.addWidget(QtWidgets.QLabel('Ambiente'))
         form.addWidget(self.environment_selector)
         self.source_selector = QtWidgets.QComboBox()
         self.source_selector.addItems(['Simulação · alvo virtual', 'Webcam · alvo real'])
         self.source_selector.setCurrentIndex(1 if self.webcam_only else 0)
-        self.source_selector.setEnabled(self.managed_session)
+        self.source_selector.setEnabled(self.managed_session and not self.environment)
         self.source_selector.setToolTip('Trocar reinicia a sessão e a calibração. Abre INICIAR_GROUNDSTATION.bat para usar esta opção.')
         self.source_selector.currentIndexChanged.connect(self._change_session_source)
         form.addWidget(QtWidgets.QLabel('Origem do vídeo'))
         form.addWidget(self.source_selector)
         session_note = QtWidgets.QLabel('As rodas e o cubo continuam simulados nos dois modos.\nTrocar de origem reinicia a sessão.')
+        if self.environment:
+            session_note.setText('Seleciona novamente o transporte para reconfigurar.')
+            self.source_selector.clear()
+            self.source_selector.addItem('Câmara do CubeSat')
         session_note.setWordWrap(True)
         session_note.setStyleSheet('color: #748398; font-size: 11px;')
         form.addWidget(session_note)
@@ -586,8 +613,48 @@ class MainWindow(QtWidgets.QMainWindow):
     def _preview_target_color(self, white):
         self.target_color_button.setText('Ponto branco' if white else 'Ponto preto')
 
+    def _connection_error(self, exc):
+        self.transport_error = True
+        self.statusBar().showMessage(f'Ligação interrompida: {exc}. Volta a selecionar o transporte.')
+
+    def _choose_connection(self, index):
+        self.environment_selector.setCurrentIndex(self.environment)
+        if index == self.environment == 0:
+            return
+        dialog = QtWidgets.QInputDialog
+        try:
+            if index == 1:
+                host, ok = dialog.getText(self, 'Wi-Fi do CubeSat', 'Endereço IPv4 do CubeSat', text='192.168.4.1')
+                if not ok:
+                    return
+                host = str(ipaddress.IPv4Address(host.strip()))
+                port, ok = dialog.getInt(self, 'Wi-Fi do CubeSat', 'Porta UDP', 5000, 1, 65535)
+                if not ok:
+                    return
+                link = UdpLink(host, port)
+                label = f'Wi-Fi · {host}:{port}'
+            elif index == 2:
+                from serial.tools import list_ports
+                ports = [port.device for port in list_ports.comports()]
+                name, ok = dialog.getItem(self, 'USB do CubeSat', 'Porta série (por exemplo COM5)', ports, 0, True)
+                if not ok or not name.strip():
+                    return
+                baud, ok = dialog.getInt(self, 'USB do CubeSat', 'Velocidade (baud)', 921600, 1, 4000000)
+                if not ok:
+                    return
+                link = SerialLink(name.strip(), baud)
+                label = f'USB · {name.strip()} · {baud} baud'
+            else:
+                link = UdpLink(port=self.simulation_port)
+                label = 'Simulação'
+        except (ImportError, OSError, ValueError) as exc:
+            QtWidgets.QMessageBox.warning(self, 'Ligação ao CubeSat', str(exc))
+            return
+        self.next_connection = (index, link, label)
+        self.close()
+
     def _change_session_source(self, index):
-        if not self.managed_session or index == (1 if self.webcam_only else 0):
+        if self.environment or not self.managed_session or index == (1 if self.webcam_only else 0):
             return
         # The launcher owns the server. Reopening a session preserves each
         # existing mode's semantics without changing simulation or detection.
@@ -762,6 +829,11 @@ class MainWindow(QtWidgets.QMainWindow):
         g3d = QtWidgets.QGroupBox("Gimbal 3D · arrastar para rodar, roda para zoom")
         v3d = QtWidgets.QVBoxLayout(g3d)
         self.cube3d = Cube3DWidget()
+        pose_bar = QtWidgets.QHBoxLayout()
+        self.quat_label = QtWidgets.QLabel('q [w, x, y, z]   —')
+        pose_bar.addWidget(self.quat_label); pose_bar.addStretch()
+        pose_bar.addWidget(button('Repor vista', self.reset_view))
+        v3d.addLayout(pose_bar)
         v3d.addWidget(self.cube3d,1)
         self.reference_status=QtWidgets.QLabel('A aguardar referência inicial')
         self.reference_status.setStyleSheet('font-size: 11px; color: #748398;')
@@ -793,6 +865,10 @@ class MainWindow(QtWidgets.QMainWindow):
         vb.addItem(pg.PlotCurveItem([160,160],[104,136],pen=pg.mkPen('#30baa8',width=1)))
         self.dot = pg.ScatterPlotItem(size=14, pen=pg.mkPen("y", width=2), brush=None, symbol="o")
         vb.addItem(self.dot)
+        self.target_vector = pg.PlotCurveItem(pen=pg.mkPen('#30baa8',width=1))
+        self.search_box = pg.PlotCurveItem(pen=pg.mkPen('#e6b545',width=1))
+        vb.addItem(self.target_vector)
+        vb.addItem(self.search_box)
         vb.setRange(xRange=(0,320),yRange=(0,240),padding=0);vb.disableAutoRange()
         virtual_layout.addWidget(self.cam)
         self.camera_tabs.addTab(virtual_page,'Câmara virtual')
@@ -804,12 +880,42 @@ class MainWindow(QtWidgets.QMainWindow):
         raw_view.addItem(self.raw_dot)
         raw_view.setRange(xRange=(0,320),yRange=(0,240),padding=0);raw_view.disableAutoRange()
         self.camera_tabs.addTab(self.raw_cam,'Webcam completa')
+        self.video_toggle = button('Mostrar imagem')
+        self.video_toggle.setCheckable(True)
+        self.video_toggle.setChecked(True)
+        self.video_toggle.toggled.connect(self.camera_tabs.setVisible)
+        bar = QtWidgets.QHBoxLayout()
+        bar.addWidget(self.video_toggle)
+        for name in ('Focar','Contínuo','Infinito'):
+            bar.addWidget(disabled(name))
+        vl.addLayout(bar)
+        thresholds = QtWidgets.QGroupBox('Análise local de luminância')
+        thresholds.setCheckable(True)
+        thresholds.setChecked(False)
+        opts = QtWidgets.QFormLayout(thresholds)
+        self.peak = self._spin(0,255,60,0,1)
+        self.fraction = self._spin(0,1,.55,2,.05)
+        self.radius = self._spin(1,120,24,0,1,' px')
+        opts.addRow('Pico mínimo',self.peak)
+        opts.addRow('Fração do pico',self.fraction)
+        opts.addRow('Janela ±',self.radius)
+        self.thresholds = thresholds
+        for widget in (self.peak,self.fraction,self.radius):
+            widget.hide()
+            opts.labelForField(widget).hide()
+            thresholds.toggled.connect(widget.setVisible)
+            thresholds.toggled.connect(opts.labelForField(widget).setVisible)
+        vl.addWidget(thresholds)
         self.camera_status = QtWidgets.QLabel('A aguardar imagem da câmara')
         self.camera_status.setStyleSheet('color: #748398; font-size: 11px;')
         self.camera_status.setWordWrap(True)
         vl.addWidget(self.camera_tabs,1); vl.addWidget(self.camera_status)
         lay.addWidget(g,1)
         return w
+
+    def reset_view(self):
+        self.cube3d.cam_elev, self.cube3d.cam_azim, self.cube3d.zoom = 26., -38., 1.
+        self.cube3d.update()
 
     def _toggle_log(self, on):
         if on:
@@ -905,6 +1011,8 @@ class MainWindow(QtWidgets.QMainWindow):
         image=image.convertToFormat(QtGui.QImage.Format_RGB888)
         pointer=image.bits();pointer.setsize(image.byteCount())
         array=np.frombuffer(pointer,np.uint8).reshape(image.height(),image.bytesPerLine())[:,:image.width()*3].reshape(image.height(),image.width(),3).copy()
+        if view==1:
+            self.instruments.image(array,len(jpeg))
         item=self.raw_item if view==0 else self.img_item
         item.setImage(array.transpose(1,0,2),levels=(0,255));item.setRect(QtCore.QRectF(0,0,320,240))
         if view==1 and self.pending_vis is not None:self.last_vis=self.pending_vis
@@ -917,8 +1025,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.send(P.tc_stream, 20, 20, self.img_every)
             self.next_ping = now + 1.0
         got_image = False
-        for kind, obj in self.link.poll():
+        try:
+            events = [] if self.transport_error else self.link.poll()
+        except OSError as exc:
+            self._connection_error(exc)
+            events = []
+        for kind, obj in events:
             self.last_rx = now
+            self.instruments.ingest(kind,obj,now)
             if kind == "state":
                 self.on_state(obj)
             elif kind == 'sim3':
@@ -945,19 +1059,32 @@ class MainWindow(QtWidgets.QMainWindow):
                 if self.img_every == 0:
                     self.last_vis = obj
             elif kind == "image":
+                self.instruments.image(obj[1],obj[1].nbytes)
                 self.img_item.setImage(obj[1].T, levels=(0, 255))
                 self.img_item.setRect(QtCore.QRectF(0,0,320,240))
                 if self.pending_vis is not None:
                     self.last_vis = self.pending_vis
                 got_image = True
 
+        self.instruments.refresh(now)
         # Atualiza o cursor amarelo em sincronia com a imagem (evita que o cursor se mova antes do corpo/frame)
         v = self.last_vis if self.img_every > 0 else self.pending_vis
         if v is not None and (got_image or self.img_every <= 2):
             if v.found and 0<=v.x<320 and 0<=v.y<240:
                 self.dot.setData([v.x], [v.y])
+                self.target_vector.setData([160,v.x],[120,v.y])
+                if self.thresholds.isChecked():
+                    shape = self.img_item.image.shape
+                    dx,dy = self.radius.value()*320/shape[0],self.radius.value()*240/shape[1]
+                    x0,x1=max(0,v.x-dx),min(320,v.x+dx)
+                    y0,y1=max(0,v.y-dy),min(240,v.y+dy)
+                    self.search_box.setData([x0,x1,x1,x0,x0],[y0,y0,y1,y1,y0])
+                else:
+                    self.search_box.setData([],[])
             else:
                 self.dot.setData([], [])
+                self.target_vector.setData([],[])
+                self.search_box.setData([],[])
 
         if len(self.buf["t"]) > 1:
             t = np.fromiter(self.buf["t"], float)
@@ -1063,12 +1190,22 @@ def main():
     a = ap.parse_args()
     app = QtWidgets.QApplication(sys.argv)
     link = SerialLink(a.serial, a.baud) if a.serial else UdpLink(a.host, a.port)
-    w = MainWindow(link, f"CubeSat · Ground Station · {'Webcam' if a.webcam else 'Simulação'}  ({a.serial or f'{a.host}:{a.port}'})", img_every=a.img_every, auto_track=a.auto_track,webcam_only=a.webcam,managed_session=a.managed_session)
-    w.webcam_index.setValue(max(0,min(9,a.camera_index)))
-    if a.webcam:QtCore.QTimer.singleShot(200,lambda:w.webcam_button.setChecked(True))
-    w.show()
-    result = app.exec_()
-    sys.exit(w.session_exit or result)
+    environment = 2 if a.serial else int(a.host != '127.0.0.1' and a.host != 'localhost')
+    label = a.serial or f'{a.host}:{a.port}'
+    while True:
+        webcam = a.webcam and not environment
+        w = MainWindow(link, f'CubeSat · Ground Station · {label}', img_every=a.img_every,
+                       auto_track=a.auto_track and not environment, webcam_only=webcam,
+                       managed_session=a.managed_session, environment=environment, simulation_port=a.port)
+        w.webcam_index.setValue(max(0,min(9,a.camera_index)))
+        if webcam:
+            QtCore.QTimer.singleShot(200, lambda: w.webcam_button.setChecked(True))
+        w.show()
+        result = app.exec_()
+        if w.next_connection is None:
+            sys.exit(w.session_exit or result)
+        environment, link, label = w.next_connection
+        w.deleteLater()
 
 
 if __name__ == "__main__":
