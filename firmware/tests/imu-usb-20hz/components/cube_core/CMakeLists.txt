@@ -1,0 +1,5 @@
+set(core_sources "cube_core3.c" "target_detect.c")
+if(BENCH_CAN_TELEMETRY)
+    list(APPEND core_sources "moteus_proto.c")
+endif()
+idf_component_register(SRCS ${core_sources} INCLUDE_DIRS "include")
