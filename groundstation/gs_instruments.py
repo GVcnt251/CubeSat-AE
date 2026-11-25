@@ -16,8 +16,9 @@ GROUPS = {
     'Identificação': 'Nome|MAC|Firmware|Build|ESP-IDF|Partição|Tempo ligado@s|Memória livre@kB|Memória mínima@kB|Flash / PSRAM|Módulos',
     'Wi-Fi e ligação': 'SSID|Endereço|Clientes|Sinal do cliente@dBm|Sinal da rede@dBm|Páginas abertas|Telemetria recebida@Hz|Pacotes perdidos|Latência PING@ms|Imagens recebidas@Hz|Tramas RX|Tramas TX',
     'IMU': 'Velocidade X@°/s|Velocidade Y@°/s|Velocidade Z@°/s|Aceleração X@m/s²|Aceleração Y@m/s²|Aceleração Z@m/s²',
+    'USB JSON': 'Estado|Validade|Taxa X|Taxa Y|Taxa Z|Acelerómetro@Hz|Giro bruto X@°/s|Giro bruto Y@°/s|Giro bruto Z@°/s',
     'Magnetómetro': 'Campo X@µT|Campo Y@µT|Campo Z@µT|Magnitude@µT',
-    'Atitude': 'Roll@°|Pitch@°|Yaw@°|Quaternion w|Quaternion x|Quaternion y|Quaternion z|Erro X@°|Erro Y@°|Erro Z@°',
+    'Atitude': 'Roll@°|Pitch@°|Yaw@°|Roll (acelerómetro)@°|Pitch (acelerómetro)@°|Quaternion w|Quaternion x|Quaternion y|Quaternion z|Erro X@°|Erro Y@°|Erro Z@°',
     'Bateria': 'Tensão recebida@V|Tensão bruta@V|Carga@%|Limiar local@V|Alarme local',
     'Controlo': 'Período@ms|Pior período@ms|Modo atual|Modo pedido|Roda no limite|Flags',
     'CAN-FD': 'Tramas enviadas|Tramas recebidas|Tramas perdidas',
@@ -27,6 +28,15 @@ GROUPS = {
 }
 for axis in 'XYZ':
     GROUPS['Motor ' + axis] = 'Velocidade@rpm|Modo de comando|Referência recebida@rpm|Binário@N·m|Corrente Iq@A|Tensão@V|Temperatura@°C|Posição@rev|Modo moteus|Falha'
+
+USB_WHEEL_STATES = {
+    'ok': 'Telemetria recebida',
+    'no_reply': 'Sem resposta',
+    'controller_unavailable': 'Controlador indisponível',
+    'query_not_sent': 'Consulta não enviada',
+    'queue_recovery_failed': 'Falha na fila de transmissão',
+}
+USB_WHEEL_PRECISION = {'Velocidade': 3, 'Binário': 6, 'Posição': 6}
 
 
 def button(text, slot=None):
@@ -54,11 +64,15 @@ def quat(angles):
 class Instruments:
     def __init__(self, window):
         self.window = window
+        self.monitor_group = 'Wi-Fi de fábrica' if window.factory_wifi else 'USB JSON'
         self.items, self.units, self.latest = {}, {}, {}
         self.history = defaultdict(lambda: deque(maxlen=3600))
         self.routes, self.panels = {}, {}
         self.next_panel = 1
         self.image_times, self.state_times = deque(), deque()
+        self.usb_sent_times = deque(maxlen=40)
+        self.usb_accel_times = deque(maxlen=12)
+        self.usb_accel_rx = None
         self.hits = 0
         self.threshold = None
         self.alarm = False
@@ -73,6 +87,11 @@ class Instruments:
         self.tree.setHeaderLabels(['Grandeza', 'Leitura', 'Unidade', 'Gráfico'])
         self.tree.setAlternatingRowColors(True)
         for group, fields in GROUPS.items():
+            if group == 'USB JSON' and window.factory_wifi:
+                group = self.monitor_group
+                fields = 'Estado|Validade|Taxa X|Taxa Y|Taxa Z'
+            if window.read_only and group.startswith('Motor '):
+                fields = 'Estado CAN|' + fields
             parent = W.QTreeWidgetItem(self.tree, [group])
             for field in fields.split('|'):
                 name, _, unit = field.partition('@')
@@ -114,10 +133,47 @@ class Instruments:
             self.history[key].append((now, value))
         self.latest[key] = (now, value)
 
+    def _monitor_wheel(self, axis, status, readings, now):
+        group = 'Motor ' + axis
+        self.put(group, 'Estado CAN', status, now)
+        for field, value in readings:
+            if isinstance(value, (int, float)) and not math.isfinite(value):
+                value = None
+            series = self.history.get((group, field))
+            if series and math.isfinite(series[-1][1]) and (value is None or now - series[-1][0] > 2):
+                series.append((now, math.nan))
+            self.put(group, field, value, now)
+
+    def _factory_telemetry(self, data, now):
+        self.state_times.append(now)
+        for axis, gyro, accel, mag in zip('XYZ', data.gyro, data.accel, data.mag):
+            self.put('IMU', 'Velocidade ' + axis, gyro, now)
+            self.put('IMU', 'Aceleração ' + axis, accel, now)
+            self.put('Magnetómetro', 'Campo ' + axis, mag, now)
+        for field, value in zip(('Tensão recebida', 'Tensão bruta', 'Carga'), data.battery):
+            self.put('Bateria', field, value if math.isfinite(value) and data.battery[0] > 0 else None, now)
+        for field, value in zip(('Tramas enviadas', 'Tramas recebidas', 'Tramas perdidas'), data.can):
+            self.put('CAN-FD', field, value, now)
+        self.put('Identificação', 'Tempo ligado', data.uptime_ms / 1000, now)
+        fields = ('Posição', 'Velocidade', 'Binário', 'Tensão', 'Corrente Iq', 'Temperatura', 'Falha', 'Modo moteus')
+        for axis, readings in zip('XYZ', data.wheels):
+            pos, speed, torque, voltage, current, temp, fault, mode = readings
+            present = any(math.isfinite(value) and value != 0 for value in readings)
+            values = (pos, 60 * speed, torque, voltage, current, temp, fault, mode) if present else (None,) * len(fields)
+            status = 'Telemetria recebida' if present else 'Sem leitura da roda'
+            self._monitor_wheel(axis, status, zip(fields, values), now)
+
     def ingest(self, kind, obj, now):
         def put(group, name, value):
             self.put(group, name, value, now)
-        if kind == 'state':
+        if kind == 'usb_wheel':
+            readings = (('Velocidade', obj.rpm), ('Binário', obj.torque_nm), ('Tensão', obj.voltage_v),
+                        ('Temperatura', obj.temperature_c), ('Posição', obj.position_rev),
+                        ('Modo moteus', obj.mode), ('Falha', obj.fault))
+            self._monitor_wheel(obj.axis, USB_WHEEL_STATES[obj.status], readings, now)
+        elif kind == 'wifi_telemetry':
+            self._factory_telemetry(obj, now)
+        elif kind == 'state':
             self.state_times.append(now)
             put('Bateria','Tensão recebida',obj.vbat)
             put('Identificação','Tempo ligado',obj.t_ms/1000)
@@ -171,6 +227,55 @@ class Instruments:
             self.echo = None
         elif kind == 'ack' and obj[0] == 0x89:
             self.manual_status.setText('Referências aceites.' if obj[2]==0 else 'Referências recusadas pelo cubo.')
+
+    @staticmethod
+    def _record_usb_time(times, timestamp):
+        if times and (timestamp < times[-1] or timestamp - times[-1] > 2_000_000):
+            times.clear()
+        if not times or timestamp > times[-1]:
+            times.append(timestamp)
+
+    def usb_acceleration_rate(self, now):
+        times = self.usb_accel_times
+        if len(times) < 2 or self.usb_accel_rx is None or now - self.usb_accel_rx > 2:
+            return 0.
+        return (len(times) - 1) * 1e6 / (times[-1] - times[0])
+
+    def usb_attitude(self, sample, angles, now):
+        self._record_usb_time(self.usb_sent_times, sample.sent_us)
+        self.put(self.monitor_group, 'Estado', str(sample.state), now)
+        self.put(self.monitor_group, 'Validade', hex(sample.validity), now)
+        angle_names = ('Roll', 'Pitch', 'Yaw')
+        q_names = tuple('Quaternion ' + axis for axis in 'wxyz')
+        rate_names = tuple('Taxa ' + axis for axis in 'XYZ')
+        if angles is None:
+            for group, names in (('Atitude', angle_names + q_names), (self.monitor_group, rate_names)):
+                for name in names:
+                    key = (group, name)
+                    self.latest.pop(key, None)
+                    self.items[key].setText(1, '—')
+            return
+        for group, names, values in (
+                ('Atitude', angle_names, angles), ('Atitude', q_names, sample.q),
+                (self.monitor_group, rate_names, sample.rates)):
+            for name, value in zip(names, values):
+                self.put(group, name, value, now)
+
+    def usb_acceleration(self, sample, tilt, now):
+        self._record_usb_time(self.usb_accel_times, sample.sample_us)
+        self.usb_accel_rx = now
+        if sample.body_rates is not None:
+            for axis, rate in zip('XYZ', sample.body_rates):
+                self.put('USB JSON', 'Giro bruto ' + axis, math.degrees(rate), now)
+        for axis, value in zip('XYZ', sample.body_acceleration):
+            self.put('IMU', 'Aceleração ' + axis, value, now)
+        for index, name in enumerate(('Roll (acelerómetro)', 'Pitch (acelerómetro)')):
+            if tilt is None:
+                key = ('Atitude', name)
+                self.latest.pop(key, None)
+                self.items[key].setText(1, '—')
+            else:
+                self.put('Atitude', name, tilt[index], now)
 
     def attitude(self, angles, now):
         if not all(math.isfinite(a) for a in angles):
@@ -335,6 +440,8 @@ class Instruments:
                 v.setValue(0)
             mode.currentIndexChanged.connect(configure)
             for widget in (mode,slider,value,button('Zero',lambda _,v=value:v.setValue(0))):
+                if self.window.read_only:
+                    widget.setEnabled(False)
                 form.addWidget(widget)
             reading = W.QLabel('—')
             form.addWidget(reading)
@@ -343,7 +450,8 @@ class Instruments:
             row.addWidget(box)
         col.addLayout(row)
         row = W.QHBoxLayout()
-        self.manual_status = W.QLabel('A aguardar ligação com controlo individual das rodas.')
+        self.manual_status = W.QLabel(f'Telemetria {self.window.monitor_transport} · só leitura' if self.window.read_only else
+                                      'A aguardar ligação com controlo individual das rodas.')
         self.manual_send = button('Aplicar velocidades X/Y/Z',self.apply_wheels)
         self.manual_send.setEnabled(False)
         row.addWidget(self.manual_send)
@@ -436,6 +544,15 @@ class Instruments:
                 queue.popleft()
             rate = (len(queue)-1)/(queue[-1]-queue[0]) if len(queue)>1 and queue[-1]>queue[0] else 0.
             self.put('Wi-Fi e ligação',name,rate,now)
+        if self.window.read_only and not self.window.factory_wifi:
+            times = self.usb_sent_times
+            fresh = self.window.last_rx is not None and now - self.window.last_rx <= 2
+            quaternion_rate = (len(times) - 1) * 1e6 / (times[-1] - times[0]) if fresh and len(times) > 1 else 0.0
+            accel_rate = self.usb_acceleration_rate(now)
+            self.put('USB JSON', 'Acelerómetro', accel_rate, now)
+            attitude_rx = self.window.usb_attitude_rx
+            active_rate = quaternion_rate if attitude_rx is not None and now - attitude_rx <= 2 else accel_rate
+            self.put('Wi-Fi e ligação', 'Telemetria recebida', active_rate, now)
         self.put('Wi-Fi e ligação','Tramas RX',link.n_rx,now)
         self.put('Wi-Fi e ligação','Tramas TX',link.n_tx,now)
         def read(group,name):
@@ -458,15 +575,35 @@ class Instruments:
             # Ping is intermittent. Every other live reading expires after two seconds.
             fresh = now-stamp <= (3 if key[1]=='Latência PING' else 2)
             item = self.items[key]
-            item.setText(1,(f'{v:.2f}'.rstrip('0').rstrip('.') if isinstance(v,float) else str(v)) if fresh else '—')
+            precision = 5 if key[0] == self.monitor_group or key[1].startswith('Quaternion ') else 2
+            if self.window.read_only and key[0].startswith('Motor '):
+                precision = USB_WHEEL_PRECISION.get(key[1], precision)
+            reading = f'{v:.{precision}f}'.rstrip('0').rstrip('.') if isinstance(v, float) else str(v)
+            item.setText(1, reading if fresh and v is not None else '—')
             if key in self.history and not item.text(3):
                 item.setText(3,'Escolher…')
-        for axis,label in zip('XYZ',self.readouts):
-            speed,torque = (read('Motor '+axis,k) for k in ('Velocidade','Binário'))
-            label.setText('Sem telemetria' if speed is None or torque is None else f'{speed:.0f} rpm  ·  {torque:.3f} N·m')
+        usb_wheel_summary = []
+        for axis, label in zip('XYZ', self.readouts):
+            group = 'Motor ' + axis
+            speed, torque = (read(group, field) for field in ('Velocidade', 'Binário'))
+            if self.window.read_only:
+                status = read(group, 'Estado CAN')
+                if status is None:
+                    status = 'Sem dados recentes' if (group, 'Estado CAN') in self.latest else 'A aguardar dados'
+                fault = read(group, 'Falha')
+                summary = f'{speed:.0f} rpm' if speed is not None else status
+                label.setText(f'{speed:.0f} rpm  ·  {torque:.3f} N·m' if speed is not None and torque is not None else status)
+                if fault:
+                    summary += f' · Falha {fault}'
+                usb_wheel_summary.append(f'{axis} · {summary}')
+            else:
+                label.setText('Sem telemetria' if speed is None or torque is None else f'{speed:.0f} rpm  ·  {torque:.3f} N·m')
+        if self.window.read_only:
+            self.window.saturation.setText('\n'.join(usb_wheel_summary))
         self.manual_send.setEnabled(self.manual_ready(now))
         self.manual_send.setToolTip('Requer telemetria Core3 recente, três motores válidos e modo WHEEL confirmado.')
-        live = voltage is not None
+        live = (self.window.last_rx is not None and now-self.window.last_rx <= 2
+                if self.window.read_only else voltage is not None)
         def number(k,n,unit):
             val = read(k,n)
             return '—' if val is None else f'{val:.1f} {unit}'

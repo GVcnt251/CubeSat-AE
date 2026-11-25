@@ -16,7 +16,8 @@ import pyqtgraph as pg
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 import gs_protocol as P
-from gs_link import SerialLink, UdpLink
+from gs_link import SerialJsonLink, SerialLink, UdpLink
+from gs_wifi import FactoryWiFiLink
 from gs_instruments import Instruments, button, disabled
 
 HIST = 600  # amostras por gráfico (30 s a 20 Hz)
@@ -49,6 +50,7 @@ class PoseBuffer:
             self.samples.clear()
             self.clock_offset = None
         if self.clock_offset is None:
+            self.samples.clear()
             self.clock_offset = now - t_ms / 1000.0
         if self.samples:
             yaw = self.unwrap(yaw, self.samples[-1][1])
@@ -56,6 +58,18 @@ class PoseBuffer:
                 target = self.unwrap(target, self.samples[-1][3])
         self.samples.append((t_ms / 1000.0 + self.clock_offset, yaw, rpm, target))
         self.last_ms, self.last_rx = t_ms, now
+
+    def ease_tilt(self, current, angles, now):
+        # Animate to a new USB accelerometer reading over a short display interval.
+        # The interpolated frames are never published as telemetry.
+        roll, pitch = current
+        end_roll = self.unwrap(angles[0], roll)
+        start = now - self.delay
+        self.samples.clear()
+        self.samples.append((start, roll, pitch, None))
+        self.samples.append((start + 0.24, end_roll, angles[1], None))
+        self.clock_offset = self.last_ms = None
+        self.last_rx = now
 
     def pose(self, now):
         if not self.samples:
@@ -92,6 +106,8 @@ class Cube3DWidget(QtWidgets.QWidget):
         self.wheel_speeds = (0.0, 0.0, 0.0)
         self.other_phases = [0.0, 0.0]
         self.has_gimbal = False
+        self.pose_readout = True
+        self.yaw_readout = True
         self.gimbal_reference = (0.0,0.0,0.0)
         self.com = (0.0,0.0,0.0)
         self.gravity = 9.80665
@@ -362,7 +378,9 @@ class Cube3DWidget(QtWidgets.QWidget):
 
         qp.setPen(QtGui.QColor(50, 60, 75))
         qp.setFont(QtGui.QFont("monospace", 8))
-        qp.drawText(8, 16, f"Rumo {self.yaw_deg:+.1f}° | Pitch {self.pitch_deg:+.1f}° | Roll {self.roll_deg:+.1f}°")
+        if self.pose_readout:
+            yaw = f"{self.yaw_deg:+.1f}°" if self.yaw_readout else "—"
+            qp.drawText(8, 16, f"Rumo {yaw} | Pitch {self.pitch_deg:+.1f}° | Roll {self.roll_deg:+.1f}°")
         if self.has_gimbal:
             self._draw_gravity(qp,w,h)
         qp.setPen(QtGui.QColor(50,60,75))
@@ -377,6 +395,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.next_connection = None
         self.transport_error = False
         self.link = link
+        self.read_only = getattr(link, 'read_only', False)
+        self.factory_wifi = getattr(link, 'factory_wifi', False)
+        self.monitor_transport = 'Wi-Fi' if self.factory_wifi else 'USB'
+        self.usb_attitude_rx = None
+        self.usb_yaw_relative = False
+        self.usb_tilt = None
+        self.usb_tilt_applied = None
+        self.usb_last_heading = 0.0
+        self.usb_video_rx = None
+        self.usb_video_samples = deque(maxlen=20)
         self.managed_session = managed_session
         self.session_exit = 0
         self.img_every = img_every
@@ -446,8 +474,10 @@ class MainWindow(QtWidgets.QMainWindow):
         stop = button('STOP · IDLE', self.stop_control)
         stop.setStyleSheet('background:#b83232;color:white;font-weight:bold;padding:7px 14px')
         stop.setToolTip('Pede modo IDLE e cancela o seguimento automático.')
+        stop.setVisible(not self.read_only)
         header.addWidget(stop)
         self.chk_log = QtWidgets.QCheckBox('Registar dados em CSV')
+        self.chk_log.setVisible(not self.read_only)
         self.chk_log.toggled.connect(self._toggle_log)
         header.addWidget(self.chk_log); outer.addLayout(header)
         self.lbl = {k: QtWidgets.QLabel('—') for k in
@@ -456,7 +486,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.metric_error = QtWidgets.QLabel('—')
         self.metric_wheel = QtWidgets.QLabel('—')
         self.saturation = QtWidgets.QLabel('Sem telemetria das rodas')
-        for name, value in (('LIGAÇÃO',self.lbl['link']), ('SEGUIMENTO',self.lbl['control']),
+        control_title = f'ATITUDE {self.monitor_transport.upper()}' if self.read_only else 'SEGUIMENTO'
+        for name, value in (('LIGAÇÃO',self.lbl['link']), (control_title,self.lbl['control']),
                             ('ERRO HORIZONTAL / VERTICAL',self.metric_error), ('RODAS DE REAÇÃO', self.saturation)):
             card = QtWidgets.QFrame(); card.setObjectName('metric')
             col = QtWidgets.QVBoxLayout(card); col.setContentsMargins(14,10,14,10)
@@ -471,10 +502,13 @@ class MainWindow(QtWidgets.QMainWindow):
         scroll.setFixedWidth(282); scroll.setWidget(self._build_controls()); grid.addWidget(scroll)
         right = QtWidgets.QVBoxLayout(); right.setSpacing(12)
         right.addWidget(self._build_side(), 3)
-        right.addWidget(self._build_plots(), 2)
+        legacy_plots = self._build_plots()
+        legacy_plots.setVisible(not self.read_only)
+        right.addWidget(legacy_plots, 2)
         grid.addLayout(right,1)
         advanced = QtWidgets.QScrollArea(); advanced.setWidgetResizable(True)
         advanced.setWidget(self._build_advanced()); self.tabs.addTab(advanced, 'Definições avançadas')
+        advanced.setEnabled(not self.read_only)
         self.instruments = Instruments(self)
 
         self.timer = QtCore.QTimer(self)
@@ -484,7 +518,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.send(P.tc_stream, 20, 20, self.img_every)
 
     def send(self, make, *args):
-        if self.transport_error or (self.environment and make.__name__.startswith('sim_')):
+        if self.read_only or self.transport_error or (self.environment and make.__name__.startswith('sim_')):
             return
         try:
             self.link.send_frame(make, *args)
@@ -543,6 +577,9 @@ class MainWindow(QtWidgets.QMainWindow):
             session_note.setText('Seleciona novamente o transporte para reconfigurar.')
             self.source_selector.clear()
             self.source_selector.addItem('Câmara do CubeSat')
+        if self.read_only:
+            session_note.setText(f'{self.monitor_transport} · telemetria e câmara em só leitura')
+            self.source_selector.setItemText(0, f'Câmara do CubeSat · {self.monitor_transport}')
         session_note.setWordWrap(True)
         session_note.setStyleSheet('color: #748398; font-size: 11px;')
         form.addWidget(session_note)
@@ -562,6 +599,7 @@ class MainWindow(QtWidgets.QMainWindow):
         lay.addWidget(target)
 
         g = QtWidgets.QGroupBox("Modo"); gl = QtWidgets.QGridLayout(g)
+        g.setEnabled(not self.read_only)
         fix = QtWidgets.QPushButton("FIXAR ALVO — controlo automático")
         fix.setText('FIXAR ALVO'); fix.setObjectName('primary')
         fix.clicked.connect(self.fix_target)
@@ -580,6 +618,7 @@ class MainWindow(QtWidgets.QMainWindow):
         lay.addWidget(g)
 
         g = QtWidgets.QGroupBox('Empurrões'); gl = QtWidgets.QGridLayout(g)
+        g.setEnabled(not self.read_only)
         for row, (axis, magnitude) in enumerate((('X',20),('Y',10))):
             for col, sign in enumerate((-1,1)):
                 value = sign*magnitude
@@ -596,6 +635,7 @@ class MainWindow(QtWidgets.QMainWindow):
         custom.clicked.connect(lambda: self.send(P.sim_shove_xy,self.shove_x.value(),self.shove_y.value()))
         gl.addWidget(custom,5,0,1,2); lay.addWidget(g)
         g = QtWidgets.QGroupBox('Câmara'); vl = QtWidgets.QVBoxLayout(g)
+        g.setEnabled(not self.read_only)
         self.webcam_button=QtWidgets.QPushButton('Ligar webcam');self.webcam_button.setCheckable(True)
         self.webcam_button.toggled.connect(self._request_camera)
         # Retained for camera telemetry and the legacy command-line entry point.
@@ -628,22 +668,52 @@ class MainWindow(QtWidgets.QMainWindow):
                 if not ok:
                     return
                 host = str(ipaddress.IPv4Address(host.strip()))
-                port, ok = dialog.getInt(self, 'Wi-Fi do CubeSat', 'Porta UDP', 5000, 1, 65535)
+                protocol, ok = dialog.getItem(
+                    self, 'Wi-Fi do CubeSat', 'Formato da telemetria',
+                    ['Firmware de fábrica · WebSocket', 'TMTC · UDP'], 0, False)
                 if not ok:
                     return
-                link = UdpLink(host, port)
-                label = f'Wi-Fi · {host}:{port}'
+                if protocol.startswith('Firmware'):
+                    link = FactoryWiFiLink(host)
+                    label = f'Wi-Fi · {host} · só leitura'
+                else:
+                    port, ok = dialog.getInt(self, 'Wi-Fi do CubeSat', 'Porta UDP', 5000, 1, 65535)
+                    if not ok:
+                        return
+                    link = UdpLink(host, port)
+                    label = f'Wi-Fi · {host}:{port}'
             elif index == 2:
                 from serial.tools import list_ports
-                ports = [port.device for port in list_ports.comports()]
+                ports = [port.device for port in sorted(list_ports.comports(), key=lambda port: port.vid is None)]
                 name, ok = dialog.getItem(self, 'USB do CubeSat', 'Porta série (por exemplo COM5)', ports, 0, True)
                 if not ok or not name.strip():
                     return
-                baud, ok = dialog.getInt(self, 'USB do CubeSat', 'Velocidade (baud)', 921600, 1, 4000000)
+                protocol, ok = dialog.getItem(
+                    self, 'USB do CubeSat', 'Formato da telemetria',
+                    ['JSON · firmware atual (só leitura)', 'TMTC · binário'], 0, False)
                 if not ok:
                     return
-                link = SerialLink(name.strip(), baud)
-                label = f'USB · {name.strip()} · {baud} baud'
+                json_mode = protocol.startswith('JSON')
+                link_type = SerialJsonLink if json_mode else SerialLink
+                default_baud = 115200 if json_mode else 921600
+                baud, ok = dialog.getInt(self, 'USB do CubeSat', 'Velocidade (baud)', default_baud, 1, 4000000)
+                if not ok:
+                    return
+                port = name.strip()
+                current = getattr(self.link, 'ser', None)
+                same_port = current is not None and current.port.casefold() == port.casefold()
+                if same_port:
+                    current.close()
+                try:
+                    link = link_type(port, baud)
+                except OSError:
+                    if same_port:
+                        try:
+                            current.open()
+                        except OSError as exc:
+                            self._connection_error(exc)
+                    raise
+                label = f'USB {"JSON" if json_mode else "TMTC"} · {port} · {baud} baud'
             else:
                 link = UdpLink(port=self.simulation_port)
                 label = 'Simulação'
@@ -829,6 +899,7 @@ class MainWindow(QtWidgets.QMainWindow):
         g3d = QtWidgets.QGroupBox("Gimbal 3D · arrastar para rodar, roda para zoom")
         v3d = QtWidgets.QVBoxLayout(g3d)
         self.cube3d = Cube3DWidget()
+        self.cube3d.pose_readout = not self.read_only
         pose_bar = QtWidgets.QHBoxLayout()
         self.quat_label = QtWidgets.QLabel('q [w, x, y, z]   —')
         pose_bar.addWidget(self.quat_label); pose_bar.addStretch()
@@ -849,10 +920,19 @@ class MainWindow(QtWidgets.QMainWindow):
             label.setToolTip('Ângulo entre o plano atual e o mesmo plano em repouso: 0° a 90°.')
             angles.addWidget(label,1,i)
         v3d.addLayout(angles)
+        if self.read_only:
+            self.reference_status.setText(f'Ângulos calculados a partir da telemetria {self.monitor_transport}')
+            for label in self.relative_labels:
+                label.setToolTip('Ângulo de atitude derivado do quaternion em graus.')
+            for label in self.plane_labels:
+                label.hide()
         self.cube3d.orientation_changed.connect(self._update_reference_labels)
-        lay.addWidget(g3d, 1)
+        if self.read_only:
+            g3d.setTitle('Atitude 3D · arrastar para rodar, roda para zoom')
+        lay.addWidget(g3d, 2 if self.read_only else 1)
 
         g = QtWidgets.QGroupBox('Vídeo e deteção'); vl = QtWidgets.QVBoxLayout(g)
+        g.setVisible(not self.read_only)
         self.camera_tabs=QtWidgets.QTabWidget()
         self.camera_tabs.setStyleSheet('QTabBar::tab { min-width: 90px; padding: 6px; font-size: 11px; }')
         virtual_page=QtWidgets.QWidget();virtual_layout=QtWidgets.QVBoxLayout(virtual_page);virtual_layout.setContentsMargins(0,0,0,0)
@@ -911,6 +991,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self.camera_status.setWordWrap(True)
         vl.addWidget(self.camera_tabs,1); vl.addWidget(self.camera_status)
         lay.addWidget(g,1)
+        if self.read_only:
+            capture = QtWidgets.QGroupBox('Câmara do CubeSat')
+            capture.setMinimumWidth(250)
+            capture_layout = QtWidgets.QVBoxLayout(capture)
+            preview = pg.GraphicsLayoutWidget()
+            preview.setBackground('#101d2e')
+            view = preview.addViewBox(lockAspect=True, invertY=True, enableMouse=False)
+            self.usb_camera_view = view
+            self.usb_snapshot_item = pg.ImageItem(axisOrder='row-major')
+            view.addItem(self.usb_snapshot_item)
+            view.setRange(xRange=(0, 160), yRange=(0, 120), padding=0)
+            view.disableAutoRange()
+            capture_layout.addWidget(preview, 1)
+            self.usb_camera_status = QtWidgets.QLabel(f'A aguardar imagem {self.monitor_transport}')
+            self.usb_camera_status.setWordWrap(True)
+            capture_layout.addWidget(self.usb_camera_status)
+            lay.addWidget(capture, 1)
         return w
 
     def reset_view(self):
@@ -950,6 +1047,16 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.csv_writer and self.last_sim3 is None:
             self.csv_writer.writerow([s.t_ms,s.mode,s.trk,s.vbat]+['']*12+
                                      [s.heading,s.rate,s.err,s.wheel_rpm,s.wheel_cmd_rpm,s.torque]+self._gimbal_csv_fields())
+
+    def on_usb_attitude(self, sample, angles, now):
+        roll, pitch, yaw = angles
+        self.usb_last_heading = yaw
+        self.usb_yaw_relative = sample.relative_yaw
+        sample_ms = sample.sample_us / 1000.0
+        self.cube3d.set_state(yaw, 0.0, t_ms=sample_ms)
+        self.cube3d.tilts.push(sample_ms, roll, pitch, None, now)
+        for name, label, angle in zip(('Roll', 'Pitch', 'Yaw'), self.relative_labels, angles):
+            label.setText(f'{name} {angle:+.1f}°')
 
     def on_sim3(self, obj):
         self.last_sim3 = obj
@@ -1017,6 +1124,42 @@ class MainWindow(QtWidgets.QMainWindow):
         item.setImage(array.transpose(1,0,2),levels=(0,255));item.setRect(QtCore.QRectF(0,0,320,240))
         if view==1 and self.pending_vis is not None:self.last_vis=self.pending_vis
 
+    def on_usb_snapshot(self, snapshot):
+        source = QtCore.QBuffer()
+        source.setData(snapshot.jpeg)
+        source.open(QtCore.QIODevice.ReadOnly)
+        reader = QtGui.QImageReader(source, b'jpeg')
+        if reader.size() != QtCore.QSize(snapshot.width, snapshot.height):
+            self.usb_camera_status.setText(f'Imagem {self.monitor_transport} inválida')
+            return
+        image = reader.read().convertToFormat(QtGui.QImage.Format_RGB888)
+        if image.isNull():
+            self.usb_camera_status.setText(f'Imagem {self.monitor_transport} inválida')
+            return
+        pixels = image.bits()
+        pixels.setsize(image.byteCount())
+        rgb = np.frombuffer(pixels, np.uint8).reshape(image.height(), image.bytesPerLine())
+        rgb = rgb[:, :3 * image.width()].reshape(image.height(), image.width(), 3).copy()
+        previous = self.usb_snapshot_item.image
+        if previous is None or previous.shape != rgb.shape:
+            self.usb_camera_view.setRange(xRange=(0, image.width()), yRange=(0, image.height()), padding=0)
+        self.usb_snapshot_item.setImage(rgb, levels=(0, 255))
+        self.instruments.image(rgb, len(snapshot.jpeg))
+        resolution = f'{image.width()} × {image.height()}'
+        if not snapshot.live:
+            self.usb_video_rx = None
+            self.usb_video_samples.clear()
+            self.usb_camera_status.setText(f'Captura USB · {resolution} · {len(snapshot.jpeg) / 1000:.1f} kB')
+            return
+        self.usb_video_rx = time.monotonic()
+        samples = self.usb_video_samples
+        if samples and not 0 < snapshot.sample_us - samples[-1] <= 2_000_000:
+            samples.clear()
+        samples.append(snapshot.sample_us)
+        fps = (len(samples) - 1) * 1e6 / (samples[-1] - samples[0]) if len(samples) > 1 else 0.0
+        rate = f' · {fps:.1f} fps' if fps > 0 else ''
+        self.usb_camera_status.setText(f'Vídeo {self.monitor_transport} · {resolution}{rate}')
+
     def tick(self):
         now = time.monotonic()
         if now >= self.next_ping:
@@ -1032,6 +1175,34 @@ class MainWindow(QtWidgets.QMainWindow):
             events = []
         for kind, obj in events:
             self.last_rx = now
+            if kind == 'wifi_telemetry':
+                self.instruments.ingest(kind, obj, now)
+                kind, obj = 'usb_attitude', obj.attitude
+            if kind == 'usb_attitude':
+                angles = obj.angles()
+                self.instruments.usb_attitude(obj, angles, now)
+                self.usb_attitude_rx = now if angles is not None else None
+                if angles is not None:
+                    self.usb_tilt_applied = None
+                    self.on_usb_attitude(obj, angles, now)
+                continue
+            if kind == 'usb_acceleration':
+                tilt = obj.tilt()
+                self.instruments.usb_acceleration(obj, tilt, now)
+                self.usb_tilt = (obj.sample_us, tilt, now) if tilt is not None else None
+                continue
+            if kind == 'usb_snapshot':
+                self.on_usb_snapshot(obj)
+                continue
+            if kind == 'usb_camera_status':
+                if self.usb_video_rx is None:
+                    self.usb_camera_status.setText({
+                        'initializing': 'A iniciar a câmara',
+                        'unavailable': 'Câmara indisponível',
+                        'capture_failed': 'A câmara não devolveu uma imagem completa',
+                        'transfer_failed': 'Transferência da imagem incompleta',
+                    }[obj])
+                continue
             self.instruments.ingest(kind,obj,now)
             if kind == "state":
                 self.on_state(obj)
@@ -1099,6 +1270,14 @@ class MainWindow(QtWidgets.QMainWindow):
         fps = (len(self.vis_times) - 1) / max(1e-3, self.vis_times[-1] - self.vis_times[0]) if len(self.vis_times) > 2 else 0.0
         self.lbl["link"].setText("sem dados" if self.last_rx is None or now - self.last_rx > 2.0 else "OK")
         self.lbl["rates"].setText(f"{self.link.n_rx} / {self.link.n_tx}")
+        if self.read_only:
+            if self.usb_video_rx is not None and now - self.usb_video_rx > 2:
+                self.usb_video_rx = None
+                self.usb_video_samples.clear()
+                self.usb_snapshot_item.clear()
+                self.usb_camera_status.setText(f'A aguardar vídeo {self.monitor_transport}')
+            self._refresh_usb_pose(now)
+            return
         if self.center_pending and s and s.mode!=0:
             if self.last_camera and self.last_camera.centering and s.mode==4:self.center_pending=False
             elif now>=self.center_next_send:
@@ -1169,6 +1348,43 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.lbl['control'].setText('Centrado na webcam' if stable else 'A centrar na webcam')
                 self.lbl['mode'].setText('CENTRO DA WEBCAM')
 
+    def _refresh_usb_pose(self, now):
+        firmware_pose = self.usb_attitude_rx is not None and now - self.usb_attitude_rx <= 2
+        link_fresh = self.last_rx is not None and now - self.last_rx <= 2
+        tilt_fresh = link_fresh and self.usb_tilt is not None and now - self.usb_tilt[2] <= 2
+        self.cube3d.yaw_readout = firmware_pose
+        self.cube3d.pose_readout = firmware_pose or tilt_fresh
+        if firmware_pose:
+            self.lbl['control'].setText('Atitude recebida · só leitura')
+            reference = 'Yaw relativo à posição inicial' if self.usb_yaw_relative else 'Atitude calculada pelo firmware'
+            self.reference_status.setText(reference)
+            return
+
+        self.quat_label.setText('q [w, x, y, z]   —')
+        if tilt_fresh:
+            sample_us, (roll, pitch), received_at = self.usb_tilt
+            rate = self.instruments.usb_acceleration_rate(now)
+            if self.usb_tilt_applied != (sample_us, received_at):
+                sample_ms = sample_us / 1000.0
+                self.cube3d.set_state(self.usb_last_heading, 0.0, t_ms=sample_ms)
+                cube = self.cube3d
+                if cube.tilts.samples and rate < 10:
+                    cube.tilts.ease_tilt((cube.roll_deg, cube.pitch_deg), (roll, pitch), now)
+                else:
+                    cube.tilts.push(sample_ms, roll, pitch, None, now)
+                self.usb_tilt_applied = (sample_us, received_at)
+            self.lbl['control'].setText('Inclinação estimada pelo acelerómetro')
+            rate_text = f' · {rate:.1f} Hz' if rate > 0 else ''
+            self.reference_status.setText(f'Roll e pitch por gravidade{rate_text} · yaw indisponível')
+            values = (f'Roll ≈ {roll:+.1f}°', f'Pitch ≈ {pitch:+.1f}°', 'Yaw —')
+        else:
+            message = 'Inclinação indisponível' if link_fresh else f'A aguardar telemetria {self.monitor_transport}'
+            self.lbl['control'].setText(message)
+            self.reference_status.setText('Vista 3D parada' if self.cube3d.poses.samples else 'A aguardar inclinação')
+            values = ('Roll —', 'Pitch —', 'Yaw —')
+        for label, value in zip(self.relative_labels, values):
+            label.setText(value)
+
     def closeEvent(self, e):
         self.timer.stop()
         self.cube3d.animation.stop()
@@ -1181,7 +1397,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1"); ap.add_argument("--port", type=int, default=5000)
     ap.add_argument("--serial", default=None, help="porta série (ex.: COM5) em vez de UDP")
-    ap.add_argument("--baud", type=int, default=921600)
+    ap.add_argument("--wifi-factory", nargs='?', const='192.168.4.1',
+                    help="liga ao firmware de fábrica por Wi-Fi (IP opcional)")
+    ap.add_argument("--baud", type=int)
+    ap.add_argument("--serial-format", choices=('tmtc', 'json'), default='tmtc',
+                    help="formato USB: TMTC binário ou telemetria JSON (só leitura)")
     ap.add_argument("--img-every", type=int, default=2, help="enviar 1 imagem a cada N frames")
     ap.add_argument("--auto-track", action="store_true", help="fixar alvo automaticamente após calibração")
     ap.add_argument('--webcam',action='store_true')
@@ -1189,9 +1409,15 @@ def main():
     ap.add_argument('--managed-session', action='store_true', help='troca de sessão gerida pelo lançador')
     a = ap.parse_args()
     app = QtWidgets.QApplication(sys.argv)
-    link = SerialLink(a.serial, a.baud) if a.serial else UdpLink(a.host, a.port)
-    environment = 2 if a.serial else int(a.host != '127.0.0.1' and a.host != 'localhost')
-    label = a.serial or f'{a.host}:{a.port}'
+    if a.serial:
+        link_type, default_baud = ((SerialJsonLink, 115200) if a.serial_format == 'json' else (SerialLink, 921600))
+        link = link_type(a.serial, a.baud if a.baud is not None else default_baud)
+    elif a.wifi_factory:
+        link = FactoryWiFiLink(str(ipaddress.IPv4Address(a.wifi_factory)))
+    else:
+        link = UdpLink(a.host, a.port)
+    environment = 2 if a.serial else int(bool(a.wifi_factory) or a.host not in ('127.0.0.1', 'localhost'))
+    label = a.serial or a.wifi_factory or f'{a.host}:{a.port}'
     while True:
         webcam = a.webcam and not environment
         w = MainWindow(link, f'CubeSat · Ground Station · {label}', img_every=a.img_every,
